@@ -127,6 +127,9 @@ typedef struct {
 } audio_in_upload_status_t;
 /** 线程安全的上传进度快照，采样单位为 16 kHz PCM；不读取编码器内部状态。 */
 void audio_in_get_upload_status(audio_in_handle_t h, audio_in_upload_status_t *status);
+/* AFE 在 AEC 后判为人声且达到能量门限的最近产生时刻，非发送完成时间。
+ * 单调毫秒低 32 位，用无符号差值计算；未运行/尚无人声返回 0。只用于活动计时。 */
+uint32_t audio_in_get_last_voice_ms(audio_in_handle_t h);
 
 /**
  * @brief 注册 PCM 帧回调

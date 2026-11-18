@@ -16,7 +16,6 @@ idf_component_register(
         "wake_word.c"
         "audio_out.c"
         "ws_service.c"
-        "response_stream.c"
 
 
         "opus_codec.c"

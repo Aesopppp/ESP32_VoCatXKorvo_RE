@@ -7,8 +7,26 @@
 #define PCM_PREFILL 4800u
 #define PCM_BLOCK 160u
 #define PCM_DMA_BLOCKS 6u
-static inline bool pcm_can_start(size_t count, bool eof)
-{ return count >= PCM_PREFILL || (eof && count > 0); }
+/* 无结束事件时，短流也最多等待 300 ms；到点播出已有数据，不等下一包。 */
+#define PCM_PREFILL_WAIT_MS 300u
+#define PCM_VOICE_MEAN_ABS 64u
+#define PCM_VOICE_MIN_SAMPLES 640u /* 40 ms 连续有效幅度，过滤单个脉冲。 */
+#define PCM_VOICE_HOLD_MS 250u
+static inline bool pcm_can_start(size_t count, bool eof, uint32_t waited_ms)
+{ return count > 0 && (count >= PCM_PREFILL || eof || waited_ms >= PCM_PREFILL_WAIT_MS); }
+/* 这是活动检测而非语义识别；阈值按增益前的 signed 16-bit PCM 计。 */
+static inline bool pcm_voice_update(uint32_t *qualified_samples, uint32_t abs_sum, size_t samples)
+{
+    if (!samples || abs_sum / samples < PCM_VOICE_MEAN_ABS) {
+        *qualified_samples = 0;
+        return false;
+    }
+    if (*qualified_samples < PCM_VOICE_MIN_SAMPLES) {
+        *qualified_samples += (uint32_t)samples;
+        if (*qualified_samples > PCM_VOICE_MIN_SAMPLES) *qualified_samples = PCM_VOICE_MIN_SAMPLES;
+    }
+    return *qualified_samples >= PCM_VOICE_MIN_SAMPLES;
+}
 static inline size_t pcm_take_count(size_t count)
 { return count < PCM_BLOCK ? count : PCM_BLOCK; }
 /* Submitted samples can still be in TX DMA: keep this horizon behind the

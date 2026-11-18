@@ -9,7 +9,7 @@
 esp_err_t device_mqtt_service_init(void);
 void device_mqtt_service_poll(bool enabled, unsigned configuration_epoch,
                               const device_handshake_response_t *configuration);
-/* 主任务单独更新空闲门禁；只在空闲时才把所有待播编号合成一个批次。 */
+/* 主任务允许通知交接：待机准备连接，或已有鉴权会话；连接中/配网时暂停。 */
 void device_mqtt_service_set_dispatch_allowed(bool allowed);
 /* 仅真实用户唤醒解除 CONNACK 4/5 五次失败的熔断；任务/定时轮询不解除。 */
 void device_mqtt_service_on_wake(void);
@@ -18,14 +18,12 @@ typedef struct {
     unsigned count;
     char task_ids[DEVICE_TASK_QUEUE_SIZE][DEVICE_TASK_ID_MAX + 1];
 } device_mqtt_delivery_t;
-typedef enum {
-    DEVICE_TASK_AUDIO_RECEIVED, /* 有有效音频、结束边界且本地输出排空。 */
-    DEVICE_TASK_FAILED,         /* 失败回执，等待平台重新投递，不自行重播。 */
-    DEVICE_TASK_NETWORK_WAIT,   /* 断网回执，保留任务至再次联网。 */
-} device_mqtt_task_result_t;
-/* 主任务仅在空闲、网络可用时批量领取；返回对象由服务拥有，必须恰好 finish 一次。
- * 成功先持久化去重记录，再回执；失败回执持久化至 broker PUBACK。 */
+/* worker 保存通知后供主任务领取；返回对象必须恰好 release 一次。
+ * handled=true：已有鉴权会话接管，或用户明确取消，消费本地通知；
+ * false：保留通知，等待用户唤醒、网络恢复或新通知后再交接，避免自唤醒循环。
+ * 两者均不代表播报结果，不发送业务 ACK。
+ * 已有会话时平台直接推音频，主任务无需为这些 ID 再发 WebSocket 请求。 */
 device_mqtt_delivery_t *device_mqtt_service_take_tasks(void);
-void device_mqtt_service_finish_tasks(device_mqtt_delivery_t *tasks, device_mqtt_task_result_t result);
+void device_mqtt_service_release_tasks(device_mqtt_delivery_t *tasks, bool handled);
 bool device_mqtt_service_voice_enabled(void);
 #endif

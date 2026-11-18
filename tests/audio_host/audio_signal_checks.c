@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #define AUDIO_OUT_SAMPLE_RATE 16000
 #define AUDIO_OUT_STATE_PLAYING 2
+#define AUDIO_OUT_STATE_IDLE 1
 static unsigned checks, summaries, writes;
 #define CHECK(x) do { ++checks; if(!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); exit(1); } } while(0)
 #define ESP_LOGI(tag,fmt,...) ((void)(tag), (void)(fmt), ++summaries)
@@ -15,6 +16,8 @@ static void *decoder=(void*)1;
 static bool stream_open,stream_eof,stream_drained,output_started;
 static size_t pcm_read,pcm_write,pcm_count;
 static unsigned drain_blocks;
+static uint32_t voice_samples,last_voice_ms;
+static int64_t prefill_started_us;
 static uint32_t underruns,supplied_samples,decoded_packets,decode_max_us,write_max_us;
 static uint32_t decode_total_us,decode_samples,decode_over_budget;
 static uint32_t signal_peak,signal_samples,signal_nonzero;

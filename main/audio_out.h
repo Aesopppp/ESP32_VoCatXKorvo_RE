@@ -31,11 +31,14 @@ int audio_out_get_volume(void);
  * M=MIC1，R=MIC3 硬件扬声器回采；阻塞到 codec_dev 完成读取，不混入软件参考。
  */
 esp_err_t audio_out_read_afe_input(int16_t *pcm, size_t bytes);
-/* true begins an idempotent stream; false seals it and drains a short final reply
- * even if its PCM never reached the prefill threshold. */
+/* true 幂等开启接收；缓存空时自然排空，新音频可继续播放，不依赖服务端 EOF。
+ * false 仅供显式关闭写入后排空；正常全双工会话不调用。 */
 void audio_out_set_streaming(bool active);
-/* Audible playback (including a temporary starvation); used by UI/diagnostics. */
+/* 实际输出有效幅度及 250 ms 短保持窗；仅供 UI，不控制麦克风或接收。 */
 bool audio_out_is_streaming(void);
+/* 最近提交给输出驱动的有效 PCM 活动，增益前判定；单调毫秒低 32 位。
+ * 0 表示当前流尚无活动，其他值用无符号差计算；静音/单点脉冲不会刷新。 */
+uint32_t audio_out_get_last_voice_ms(void);
 bool audio_out_is_drained(void);
 /* Enqueue 16 kHz mono signed 16-bit PCM. Length is bytes. Bounded backpressure. */
 esp_err_t audio_out_write(const int16_t *pcm_data, size_t pcm_len);
@@ -43,7 +46,7 @@ esp_err_t audio_out_write(const int16_t *pcm_data, size_t pcm_len);
 int audio_out_play_opus(const uint8_t *opus_data, size_t opus_len);
 /* Discard queued PCM, ramp to silence and overwrite the TX DMA horizon. */
 esp_err_t audio_out_stop(void);
-/* 平台信号快速通道：仅写原子标志，解除 PCM 写入等待；不在回调内操作 I2S。 */
+/* 会话停止快速通道：仅写原子标志，解除 PCM 写入等待；不在回调内操作 I2S。 */
 void audio_out_request_stop(void);
 bool audio_out_stop_requested(void);
 esp_err_t audio_out_clear_queue(void);

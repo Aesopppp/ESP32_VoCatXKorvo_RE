@@ -1,5 +1,5 @@
 /**
- * proto_service.h -- ACOS V1 protocol frame parsing & construction.
+ * proto_service.h -- Full-duplex gateway JSON parsing & construction.
  *
  *   - JSON parser: cJSON，按对象层级读取字段；结果持有有界副本。
  *   - Frame builders:
@@ -14,6 +14,8 @@
  *   Server -> Client JSON events:
  *     __proxy_connected__, input_audio_buffer.speech_started,
  *     input_audio_buffer.speech_stopped, response.audio.done, error.
+ *   Only authentication and error events control the connection; speech and
+ *   response notifications never gate the continuous binary audio stream.
  *
  *   Dependencies: cJSON (implementation only).
  */
@@ -57,7 +59,6 @@ typedef enum {
 } proto_event_t;
 
 /* ---- Parsed message (owns its strings; no JSON/cJSON lifetime dependency) -- */
-#define PROTO_RESPONSE_ID_SIZE 128
 typedef struct {
     proto_event_t  evt;             /* mapped event id                       */
     char           raw_type[80];
@@ -70,17 +71,6 @@ typedef struct {
     char           error_msg[193]; /* 仅错误说明允许截短，不参与 ID 匹配 */
     int            error_msg_len;
 
-    /* speech_started/stopped: optional session_id echoed by server */
-    char           session_id[128];
-    int            session_id_len;
-
-    /* response.audio.done: optional reason */
-    char           reason[64];
-    int            reason_len;
-    char           status[32];
-    int            status_len;
-    char           response_id[PROTO_RESPONSE_ID_SIZE];
-    bool           has_tool_call;
 } proto_msg_t;
 
 /* ---- Public API --------------------------------------------------------- */
@@ -106,13 +96,6 @@ bool proto_is_auth_error(const proto_msg_t *msg);
  * @param msg      output, caller-owned.
  */
 proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg);
-typedef void (*proto_event_callback_t)(proto_event_t event);
-/* Register before starting the WebSocket client. */
-void proto_service_register_callback(proto_event_callback_t callback);
-proto_result_t proto_dispatch_data(const char *data, size_t len);
-
-/** Clear the caller-owned result. */
-void proto_msg_clear(proto_msg_t *msg);
 
 /**
  * @brief Build `auth` JSON frame (first message after WebSocket open).

@@ -12,8 +12,8 @@ static void parser_checks(void)
 {
     device_mqtt_task_t task;
     CHECK(device_mqtt_parse_task(message, strlen(message), &task));
-    CHECK(!strcmp(task.id, "42") && !strcmp(task.payload, message));
-    /* 迟到、转义内容和 Unicode 文本必须保留原报文。 */
+    CHECK(!strcmp(task.id, "42"));
+    /* 迟到、转义内容和 Unicode 文本可接受，只保留任务 ID。 */
     const char *invalid[] = { "", "{}", "[]", "null", "{\"a\":{}}", "{\"a\":[]}",
         "{\"content\":\"bad\\u0000text\"}", "{\"task_id\":\"a\",\"task_id\":\"b\"}",
         "{\"task_id\":\"task-1\",\"kind\":\"reminder\",\"content\":\"x\",\"fire_at\":\"2020-11-03T06:00:00Z\"}",
@@ -34,7 +34,7 @@ static void parser_checks(void)
     cJSON_ReplaceItemInObjectCaseSensitive(json, "content", cJSON_CreateString("引号\"、换行\n、\\路径"));
     char *text = cJSON_PrintUnformatted(json);
     CHECK(device_mqtt_parse_task(text, strlen(text), &task));
-    CHECK(!strcmp(task.payload, text)); free(text); cJSON_Delete(json);
+    CHECK(!strcmp(task.id, "42")); free(text); cJSON_Delete(json);
     char trailing[512]; snprintf(trailing, sizeof(trailing), "%s true", message);
     CHECK(!device_mqtt_parse_task(trailing, strlen(trailing), &task));
     snprintf(trailing, sizeof(trailing), "%s \r\n", message);
@@ -58,30 +58,6 @@ static void fragment_checks(void)
     CHECK(device_mqtt_assemble(&s, true, 1, 0, "\0", 1) == DEVICE_MQTT_FRAGMENT_REJECTED);
     CHECK(device_mqtt_assemble(&s, true, total, 0, message, total) == DEVICE_MQTT_FRAGMENT_COMPLETE);
 }
-static void history_checks(void)
-{
-    device_mqtt_history_t h;
-    device_mqtt_history_init(&h, "device-1");
-    CHECK(device_mqtt_history_valid(&h, "device-1"));
-    CHECK(!device_mqtt_history_valid(&h, "device-2"));
-    for (unsigned i = 0; i < 64; ++i) {
-        char id[32]; snprintf(id, sizeof(id), "%u", i);
-        CHECK(device_mqtt_history_find(&h, id) < 0);
-        unsigned slot = device_mqtt_history_add(&h, id);
-        CHECK(device_mqtt_history_add(&h, id) == slot);
-        CHECK(device_mqtt_history_find(&h, id) == (int)slot);
-    }
-    device_mqtt_history_t reboot = h;
-    for (unsigned i = 32; i < 64; ++i) {
-        char id[32]; snprintf(id, sizeof(id), "%u", i);
-        CHECK(device_mqtt_history_find(&reboot, id) >= 0);
-    }
-    CHECK(device_mqtt_history_find(&reboot, "0") < 0);
-    CHECK(device_mqtt_history_valid(&reboot, "device-1")); /* prior history format remains readable */
-    reboot.next = 32; CHECK(!device_mqtt_history_valid(&reboot, "device-1"));
-    reboot = h; memset(reboot.ids[0], 'x', sizeof(reboot.ids[0]));
-    CHECK(!device_mqtt_history_valid(&reboot, "device-1"));
-}
 static void retry_checks(void)
 {
     for (unsigned seed = 0; seed < 41; ++seed) {
@@ -103,7 +79,7 @@ static void retry_checks(void)
 }
 int main(void)
 {
-    parser_checks(); fragment_checks(); history_checks(); retry_checks();
+    parser_checks(); fragment_checks(); retry_checks();
     printf("Device MQTT protocol: %u checks passed\n", checks);
     return 0;
 }

@@ -69,11 +69,21 @@ static int s_fetch_chunksize = 0;
 #define AUDIO_UPLOAD_FIFO_MS 512u
 #define AUDIO_DIAGNOSTIC_ENERGY 2500
 static SemaphoreHandle_t s_audio_buffer_lock;
-static bool s_audio_buffer_enabled = true; /* 同一缓存锁保护；提醒只播放，不生成上传积压。 */
+static bool s_audio_buffer_enabled = true; /* 同一缓存锁保护；会话内一直允许连续上传。 */
 static wake_word_audio_progress_t s_audio_progress;
 static uint32_t s_overflow_log_ms;
 static uint32_t s_overflow_frames; /* 限频日志之间累计，不能只报最后一次丢帧。 */
-static int32_t afe_frame_energy(const int16_t *pcm, int samples);
+static int32_t afe_frame_energy(const int16_t *pcm, int samples)
+{
+    if (!pcm || samples <= 0) return 0;
+    int64_t sum = 0;
+    for (int i = 0; i < samples; ++i) {
+        int32_t sample = pcm[i];
+        sum += (int64_t)sample * sample;
+    }
+    return (int32_t)(sum / samples);
+}
+
 
 static size_t audio_buffer_frames_locked(void)
 {
@@ -156,8 +166,11 @@ static void buffer_afe_audio(const afe_fetch_result_t *res)
     if (stored) {
         s_audio_progress.written_end += s_fetch_chunksize;
         if (res->vad_state == VAD_SPEECH &&
-            afe_frame_energy(res->data, s_fetch_chunksize) >= AUDIO_DIAGNOSTIC_ENERGY)
+            afe_frame_energy(res->data, s_fetch_chunksize) >= AUDIO_DIAGNOSTIC_ENERGY) {
             s_audio_progress.speech_end = s_audio_progress.written_end;
+            uint32_t voice_ms=(uint32_t)(esp_timer_get_time()/1000);
+            s_audio_progress.last_voice_ms=voice_ms ? voice_ms : UINT32_MAX;
+        }
     }
     s_overflow_frames += dropped;
     uint32_t now = esp_log_timestamp(), report_dropped = 0;
@@ -173,16 +186,6 @@ static void buffer_afe_audio(const afe_fetch_result_t *res)
                  (unsigned long)(report_dropped * s_fetch_chunksize / (BSP_I2S_SAMPLE_RATE / 1000u)));
 }
 
-static int32_t afe_frame_energy(const int16_t *pcm, int samples)
-{
-    if (!pcm || samples <= 0) return 0;
-    int64_t sum = 0;
-    for (int i = 0; i < samples; ++i) {
-        int32_t sample = pcm[i];
-        sum += (int64_t)sample * sample;
-    }
-    return (int32_t)(sum / samples);
-}
 
 /* ===========================================================================
  * feed_Task — I²S DMA → AFE

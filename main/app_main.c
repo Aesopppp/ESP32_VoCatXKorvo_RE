@@ -6,10 +6,10 @@
  * 系统架构
  * ══════════════════════════════════════════════════════════════════════════════
  * P0 收音链路：MIC(ES7210) → I²S DMA → AFE(WakeNet VAD) → RingBuffer
- *              → audio_in(VAD切句) → Opus编码 → WS JSON帧 → ACOS云端
+ *              → audio_in(连续上传) → Opus编码 → WS JSON帧 → 平台
  *
  * P1放音链路：ACOS WS(Opus) → Opus解码 → ES8311 DAC → 功放 → 扬声器
- *              支持 Barge-In 打断
+ *              与上行并行运行，平台决定输出内容及打断
  *
  * 依赖：ESP-IDF v6.1 + esp-sr
  */
@@ -22,6 +22,7 @@
 #include "freertos/queue.h"
 #include "freertos/event_groups.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_random.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -36,6 +37,7 @@
 #include "board_service.h"
 #include "event_bus.h"
 #include "app_state.h"
+#include "session_policy.h"
 #include "wifi_service.h"
 #include "cfg_service.h"
 #include "device_handshake_service.h"
@@ -133,68 +135,75 @@ static esp_err_t system_init(void)
 static bool conversation_active;
 /* 主任务拥有。结束对话/进入配网先清除此意图，迟到的错误不得重新拉起会话。 */
 static bool session_requested;
-/* 提醒独占一次临时 WS 会话，结束回待机。主任务不改 MQTT/NVS 内部状态。 */
+/* 只持有建连时的任务通知；鉴权后交还 MQTT，不跟踪播报结果。 */
 static device_mqtt_delivery_t *reminder_task;
-static bool reminder_requested;
-static int64_t reminder_deadline_ms;
+static uint32_t session_started_ms;
 /* 每次主动唤醒最多因鉴权失败重新握手一次；普通网络恢复不消耗该次数。 */
 static bool voice_auth_refresh_used, awaiting_voice_auth, waiting_for_credentials;
-static int64_t retry_at_ms, auth_deadline_ms, response_deadline_ms;
+static int64_t retry_at_ms, auth_deadline_ms;
 static int64_t resume_deadline_ms;
+static bool cleanup_pending;
+static int64_t cleanup_at_ms;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+
+static void release_reminder(bool handled)
+{
+    if (!reminder_task) return;
+    device_mqtt_service_release_tasks(reminder_task, handled);
+    reminder_task = NULL;
+}
+
+/* 停止超时不能清 FIFO 或切采样基准；关闭 transport 后允许上传任务退出。 */
+static void stop_session_audio(void)
+{
+    (void)audio_in_stop(audio_in_get_handle());
+    esp_err_t transport = ws_service_disconnect();
+    esp_err_t input = app_state_back_to_wait_wake();
+    cleanup_pending = transport != ESP_OK || input != ESP_OK;
+    if (cleanup_pending) {
+        cleanup_at_ms = now_ms() + 5000;
+        app_state_set(APP_STATE_ERROR);
+        ESP_LOGW(TAG, "Session cleanup pending: websocket=%s input=%s; retaining microphone FIFO",
+                 esp_err_to_name(transport), esp_err_to_name(input));
+        return;
+    }
+    cleanup_at_ms = 0;
+    wake_word_clear_audio_buffer();
+}
 
 static void end_conversation(const char *reason)
 {
     device_mqtt_service_set_dispatch_allowed(false);
-    if (reminder_task) {
-        device_mqtt_service_finish_tasks(reminder_task,
-            wifi_service_get_state() != WIFI_STATE_GOT_IP ? DEVICE_TASK_NETWORK_WAIT : DEVICE_TASK_FAILED);
-        reminder_task = NULL;
-    }
-    reminder_requested = false;
-    reminder_deadline_ms = 0;
+    /* 尚未关联到会话的任务保留；主动触屏取消由调用者先消费通知。 */
+    release_reminder(false);
     session_requested = conversation_active = false;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
-    retry_at_ms = auth_deadline_ms = response_deadline_ms = 0;
-    resume_deadline_ms = 0;
-    /* 先停上传/播放，再启用 WakeNet，避免结束时把自己的尾音当成新唤醒。 */
-    app_state_pause_silence_timer();
-    esp_err_t input_err = audio_in_stop(audio_in_get_handle());
-    if (input_err != ESP_OK) ESP_LOGW(TAG, "Audio stop failed: %s", esp_err_to_name(input_err));
-    esp_err_t err = ws_service_disconnect();
-    if (err != ESP_OK) ESP_LOGW(TAG, "WS stop failed: %s", esp_err_to_name(err));
-    app_state_back_to_wait_wake(false);
-    wake_word_clear_audio_buffer();
-    wake_word_set_audio_buffer_enabled(true);
+    retry_at_ms = auth_deadline_ms = resume_deadline_ms = 0;
+    /* WS 关闭即平台挂断；不发送额外结束或 cancel 帧。 */
+    stop_session_audio();
     if (wifi_service_get_state() == WIFI_STATE_GOT_IP) led_set_waiting_wake();
     else led_set_wifi_err();
-    ESP_LOGI(TAG, "Conversation ended: %s; waiting for wake word", reason);
+    ESP_LOGI(TAG, "Conversation ended: %s; cleanup_pending=%d", reason, cleanup_pending);
 }
 
 static void recover_session(const char *reason)
 {
     if (!session_requested || provisioning_service_is_active()) return;
-    /* 提醒可能已经发出/部分播出；失败不能自行重发并声称恰好一次。 */
-    if (reminder_task) { end_conversation(reason); return; }
     ESP_LOGW(TAG, "Session recovery: %s", reason);
-    if (conversation_active && !resume_deadline_ms) resume_deadline_ms = now_ms() + 60000;
-    app_state_back_to_wait_wake(false);
-    esp_err_t err = ws_service_disconnect();
-    if (err != ESP_OK) ESP_LOGW(TAG, "WS stop pending: %s", esp_err_to_name(err));
-    wake_word_clear_audio_buffer();
-    auth_deadline_ms = response_deadline_ms = 0;
+    if (!resume_deadline_ms) resume_deadline_ms = now_ms() + 60000;
+    conversation_active = false;
+    stop_session_audio();
+    auth_deadline_ms = 0;
     awaiting_voice_auth = waiting_for_credentials = false;
     retry_at_ms = now_ms() + 5000;
-    ESP_LOGW(TAG, "Reconnect scheduled in 5000 ms; resume_conversation=%d (no voice required)",
-             conversation_active);
+    ESP_LOGW(TAG, "Reconnect scheduled in 5000 ms; session request retained");
     led_set_ws_err();
 }
 
 static void handle_voice_auth_failure(const char *reason)
 {
     if (!session_requested) return;
-    if (reminder_task) { end_conversation(reason); return; }
     if (!device_handshake_service_is_enabled() || voice_auth_refresh_used) {
         ESP_LOGE(TAG, "Voice authentication failed; automatic retries stopped (check gateway auth protocol)");
         end_conversation(reason);
@@ -209,7 +218,7 @@ static void handle_voice_auth_failure(const char *reason)
 
 static void retry_voice_connection(int64_t now)
 {
-    if (!session_requested || !retry_at_ms || now < retry_at_ms ||
+    if (!session_requested || cleanup_pending || !retry_at_ms || now < retry_at_ms ||
         wifi_service_get_state() != WIFI_STATE_GOT_IP || provisioning_service_is_active()) return;
     const device_handshake_response_t *configuration = NULL;
     device_ws_readiness_t readiness = device_handshake_service_prepare_websocket(&configuration);
@@ -245,37 +254,36 @@ static void retry_voice_connection(int64_t now)
         auth_deadline_ms = now_ms() + 20000;
     } else {
         ESP_LOGW(TAG, "WebSocket prepare/start failed: %s", esp_err_to_name(err));
-        if (reminder_task) { end_conversation("reminder connection failed"); return; }
         retry_at_ms = now_ms() + 5000;
     }
 }
 
-static void resume_listening(bool keep_buffered_speech, const char *reason)
+static void start_audio_session(const char *reason)
 {
-    /* 切模式会清空 FIFO/采样位置，必须在启动上传任务之前完成，不能让新的
-     * sent_end 和被复位的 AFE 位置属于不同基准。 */
-    if (wake_word_get_mode() != WAKE_WORD_MODE_LITE) {
-        if (wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
-            recover_session("could not select listening AFE");
-            return;
-        }
-        ESP_LOGI(TAG, "AFE mode -> LITE (WakeNet disabled for audio)");
+    if (conversation_active) return; /* 重复鉴权通知不得重置正在上传的 FIFO。 */
+    /* 模式切换和 FIFO 清理在创建上传任务之前完成，采样位置使用同一基准。 */
+    if (wake_word_get_mode() != WAKE_WORD_MODE_LITE &&
+        wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
+        recover_session("could not select listening AFE");
+        return;
     }
-    if (!keep_buffered_speech) wake_word_clear_audio_buffer();
-    response_deadline_ms = 0;
+    wake_word_clear_audio_buffer();
     if (app_state_start_listening() != ESP_OK) {
         recover_session("could not start audio upload");
         return;
     }
-
+    conversation_active = true;
+    session_started_ms = (uint32_t)now_ms();
     resume_deadline_ms = 0;
+    release_reminder(true); /* 仅表示通知已关联到会话，绝非播放完成 ACK。 */
     led_set_listening();
-    ESP_LOGI(TAG, "Conversation listening; source=%s; ready for the next question", reason);
+    ESP_LOGI(TAG, "Full-duplex session active; source=%s; continuous microphone and playback", reason);
 }
 
 /* 唤醒词、按键和触屏共用入口：待机不上传，认证成功后才开始监听。 */
 static void start_conversation(const char *reason)
 {
+    if (cleanup_pending) return;
     if (provisioning_service_is_active()) {
         wake_word_reset();
         ESP_LOGI(TAG, "Talk ignored during Wi-Fi setup");
@@ -287,19 +295,20 @@ static void start_conversation(const char *reason)
         ESP_LOGW(TAG, "Talk ignored: Wi-Fi not ready");
         return;
     }
-    device_mqtt_service_on_wake();
     device_mqtt_service_set_dispatch_allowed(false);
-    if (reminder_task) end_conversation("user wake during reminder");
     if (session_requested) {
-        if (app_state_get() == APP_STATE_LISTENING) app_state_reset_silence_timer();
         return; /* 连接中或会话中重复按键不重复发送请求。 */
     }
     session_requested = true;
+    resume_deadline_ms = now_ms() + 60000;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
-    wake_word_set_mode(WAKE_WORD_MODE_LITE);
+    if (wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
+        end_conversation("could not prepare microphone");
+        return;
+    }
+    (void)wifi_service_set_audio_active(true);
     if (ws_service_get_state() == WS_STATE_CONNECTED) {
-        conversation_active = true;
-        resume_listening(false, reason);
+        start_audio_session(reason);
     } else {
         app_state_set(APP_STATE_WS_CONNECTING_WAKE);
         retry_at_ms = now_ms();
@@ -308,31 +317,43 @@ static void start_conversation(const char *reason)
     }
 }
 
-/* 平台断句后只放行下行，不暂停/停止麦克风。新的发言由平台判定，
- * 设备不再根据本地 VAD 或尚未上传的缓存取消回答。 */
-static void process_reply_offer(void)
+/* 界面状态只描述当前输出，切换表情不启停麦克风/播放器。 */
+static void poll_conversation(void)
 {
-    ws_reply_offer_t offer;
-    if (!conversation_active || !ws_service_get_reply_offer(&offer)) return;
-    app_state_t current = app_state_get();
-    if (current != APP_STATE_LISTENING && current != APP_STATE_PLAYING) return;
+    if (!conversation_active || ws_service_get_state() != WS_STATE_CONNECTED) return;
+    audio_in_handle_t input = audio_in_get_handle();
     audio_in_upload_status_t upload;
-    audio_in_get_upload_status(audio_in_get_handle(), &upload);
-    if (!upload.running) { recover_session("continuous audio upload stopped"); return; }
-    if (!ws_service_accept_reply(&offer)) return; /* 旧批准不能放行新回合。 */
-    app_state_pause_silence_timer();
-    app_state_set(APP_STATE_PLAYING);
-    response_deadline_ms = now_ms() + 45000;
-    ESP_LOGI(TAG, "Platform reply accepted: turn=%lu; microphone upload continues",
-             (unsigned long)offer.turn);
+    audio_in_get_upload_status(input, &upload);
+    if (!upload.running) {
+        recover_session("continuous audio upload stopped");
+        return;
+    }
+    uint32_t input_voice = audio_in_get_last_voice_ms(input);
+    uint32_t output_voice = audio_out_get_last_voice_ms();
+    /* 活动由其他任务更新；读取后取 now，避免把刚产生的时间当作回绕旧值。 */
+    if (session_silence_expired((uint32_t)now_ms(), session_started_ms,
+                              input_voice, output_voice)) {
+        end_conversation("60s without voice in either direction");
+        return;
+    }
+    app_state_t desired = audio_out_is_streaming() ? APP_STATE_PLAYING : APP_STATE_LISTENING;
+    if (app_state_get() == desired) return;
+    app_state_set(desired);
+    if (desired == APP_STATE_PLAYING) led_set_speaking();
+    else led_set_listening();
 }
 
-/* worker 已停止并隔离旧播放；这里只更新 UI/静默计时，保持同一上传任务。
- * 查询当前阶段，防止迟到事件把已开始的新回答切回监听。 */
-static void process_platform_interruption(void)
+/* 首页轻触是会话开关；设置菜单只发自身动作，不会调用此入口。 */
+static void handle_talk_action(const char *reason)
 {
-    if (!conversation_active || !ws_service_reply_interrupted()) return;
-    resume_listening(true, "platform interruption; microphone retained");
+    if (provisioning_service_is_active()) return;
+    if (session_requested) {
+        release_reminder(true); /* 用户拒绝本次唤醒，不能又被同一通知自动拉起。 */
+        end_conversation(reason);
+    } else {
+        device_mqtt_service_on_wake();
+        start_conversation(reason);
+    }
 }
 
 static esp_err_t start_saved_wifi(void)
@@ -348,6 +369,7 @@ static esp_err_t start_saved_wifi(void)
 static void enter_provisioning(const char *reason)
 {
     if (provisioning_service_is_active()) return;
+    release_reminder(true);
     end_conversation(reason);
     esp_err_t err = provisioning_service_start();
     if (err == ESP_OK) {
@@ -364,7 +386,7 @@ static void leave_provisioning(const char *reason)
 {
     if (!provisioning_service_is_active()) return;
     esp_err_t err = provisioning_service_stop();
-    app_state_back_to_wait_wake(false);
+    app_state_back_to_wait_wake();
     led_set_wifi_err();
     ESP_LOGI(TAG, "Wi-Fi setup closed: %s; reconnecting saved network", reason);
     if (err != ESP_OK) {
@@ -461,9 +483,8 @@ static void update_ui_snapshot(int64_t now)
         switch (app_state_get()) {
         case APP_STATE_LISTENING: snapshot.status = UI_STATUS_LISTENING; break;
         case APP_STATE_PLAYING:
-            snapshot.status = audio_out_is_streaming() ? UI_STATUS_SPEAKING : UI_STATUS_WAIT_REPLY;
+            snapshot.status = UI_STATUS_SPEAKING;
             break;
-        case APP_STATE_CANCELLING: snapshot.status = UI_STATUS_CANCELLING; break;
         case APP_STATE_WS_CONNECTING:
         case APP_STATE_WS_CONNECTING_WAKE: snapshot.status = UI_STATUS_CONNECTING; break;
         case APP_STATE_ERROR: snapshot.status = UI_STATUS_ERROR; break;
@@ -476,45 +497,29 @@ static void update_ui_snapshot(int64_t now)
 static bool tagged_ws_event(event_type_t id)
 {
     return id == EV_WS_CONNECTED || id == EV_WS_AUTH_OK || id == EV_WS_ERROR ||
-           id == EV_WS_DISCONNECTED || id == EV_WS_SERVER_ERROR || id == EV_WS_AUTH_FAILED || id == EV_WS_RESPONSE_INTERRUPTED ||
-           id == EV_WS_SPEECH_STARTED || id == EV_WS_SPEECH_STOPPED ||
-           id == EV_WS_RESPONSE_DONE || id == EV_WS_RESPONSE_CONTINUED ||
-           id == EV_AUDIO_UPLOAD_FAILED;
+           id == EV_WS_DISCONNECTED || id == EV_WS_SERVER_ERROR ||
+           id == EV_WS_AUTH_FAILED || id == EV_AUDIO_UPLOAD_FAILED;
 }
 
-/* 提醒不打断活跃对话；空闲时批量起独立 WS 会话，由智能体按 task_ids 取内容。 */
+/* MQTT 只触发唤醒；在线会话由平台直接插播，不重连、不重复提交 task_ids。 */
 static void poll_reminder(void)
 {
-    if (reminder_task) {
-        if (now_ms() >= reminder_deadline_ms ||
-            (reminder_requested && ws_service_reminder_timed_out()))
-            end_conversation("reminder request/playback timed out");
-        return;
-    }
-    if (session_requested || provisioning_service_is_active() ||
+    if (reminder_task || cleanup_pending || provisioning_service_is_active() ||
         wifi_service_get_state() != WIFI_STATE_GOT_IP ||
-        app_state_get() != APP_STATE_WAIT_WAKE || !device_mqtt_service_voice_enabled()) return;
+        !device_mqtt_service_voice_enabled()) return;
+    if (session_requested && !conversation_active) return; /* 等当前连接认证。 */
+    if (conversation_active && ws_service_get_state() != WS_STATE_CONNECTED) return;
     reminder_task = device_mqtt_service_take_tasks();
     if (!reminder_task) return;
-    device_mqtt_service_set_dispatch_allowed(false);
-    session_requested = true;
-    conversation_active = false;
-    reminder_requested = false;
-    voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
-    app_state_pause_silence_timer();
-    reminder_deadline_ms = now_ms() + 360000;
-    app_state_set(APP_STATE_REMINDER_WAITING);
-    wake_word_set_audio_buffer_enabled(false);
-    /* 提醒只下行播放；关闭 WakeNet 避免播报内容唤醒自己，不启动麦克风上传。
-     * 复用现有 Wi-Fi 音频模式，结束路径的 audio_in_stop 会恢复省电。 */
-    if (wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
-        end_conversation("reminder AFE setup failed");
+    if (conversation_active) {
+        ESP_LOGI(TAG, "Task notification handled by active session: count=%u; platform pushes audio",
+                 reminder_task->count);
+        release_reminder(true);
         return;
     }
-    (void)wifi_service_set_audio_active(true);
-    retry_at_ms = now_ms();
-    ESP_LOGI(TAG, "Reminder selected: task_count=%u; connecting without microphone upload",
-             reminder_task->count);
+    ESP_LOGI(TAG, "Task notification wakes full-duplex session: count=%u", reminder_task->count);
+    start_conversation("MQTT notification");
+    if (!session_requested) release_reminder(false);
 }
 
 static void main_task(void *arg)
@@ -529,7 +534,7 @@ static void main_task(void *arg)
         ESP_LOGW(TAG, "Device MQTT unavailable: %s", esp_err_to_name(mqtt_err));
     conversation_active = false;
     resume_deadline_ms = 0;
-    ESP_LOGI(TAG, "Boot session=%08lx reset_reason=%d build=platform-barge-in-v1; fresh wake required",
+    ESP_LOGI(TAG, "Boot session=%08lx reset_reason=%d build=unified-full-duplex-v1; fresh wake required",
              (unsigned long)esp_random(), esp_reset_reason());
     app_state_set(APP_STATE_WAIT_WAKE);
     led_set_wifi_err();
@@ -541,7 +546,6 @@ static void main_task(void *arg)
             if (tagged_ws_event(event.type) &&
                 ((uint32_t)(uintptr_t)event.payload != ws_service_generation() ||
                  !session_requested)) continue;
-            app_state_t current_state = app_state_get();
             switch (event.type) {
             case EV_WIFI_GOT_IP:
                 if (provisioning_service_is_active() || wifi_service_get_state() != WIFI_STATE_GOT_IP) break;
@@ -549,7 +553,7 @@ static void main_task(void *arg)
                 /* 普通联网不打开 WS；重复 IP 事件不能打断正在进行的对话。 */
                 if (!session_requested) {
                     ESP_LOGI(TAG, "Wi-Fi ready; waiting for wake word before connecting");
-                    app_state_back_to_wait_wake(false);
+                    app_state_back_to_wait_wake();
                     led_set_waiting_wake();
                 }
                 break;
@@ -580,21 +584,12 @@ static void main_task(void *arg)
                 change_volume(event.type == EV_BUTTON_VOLUME_UP);
                 break;
             case EV_UI_TALK:
+                handle_talk_action("home touch");
+                break;
             case EV_BUTTON_TALK:
-                if (reminder_task) {
-                    end_conversation("reminder cancelled by touch/button");
-                    break;
-                }
-                /* 首页监听画面轻触结束对话；保留实体 REC 键的原有唤醒规则。 */
-                if (event.type == EV_UI_TALK && current_state == APP_STATE_LISTENING) {
-                    end_conversation("touch while listening");
-                    break;
-                }
-                /* 播放中轻触不再触发本地打断；监听时轻触结束对话的规则保留。 */
-                if (current_state == APP_STATE_PLAYING)
-                    ESP_LOGI(TAG, "Talk ignored during playback; interruption is platform controlled");
-                else {
-                    start_conversation(event.type == EV_UI_TALK ? "touch" : "REC button");
+                if (!session_requested) {
+                    device_mqtt_service_on_wake();
+                    start_conversation("REC button");
                 }
                 break;
             case EV_UI_BRIGHTNESS_DOWN:
@@ -602,7 +597,10 @@ static void main_task(void *arg)
                 change_brightness(event.type == EV_UI_BRIGHTNESS_UP);
                 break;
             case EV_BUTTON_END_TALK:
-                if (!provisioning_service_is_active()) end_conversation("REC held for 2s");
+                if (!provisioning_service_is_active()) {
+                    release_reminder(true);
+                    end_conversation("REC held for 2s");
+                }
                 break;
             case EV_BUTTON_PROVISION:
                 enter_provisioning("BOOT held for 3s");
@@ -622,17 +620,8 @@ static void main_task(void *arg)
             case EV_WS_AUTH_OK:
                 auth_deadline_ms = retry_at_ms = 0;
                 awaiting_voice_auth = false;
-                if (reminder_task) {
-                    /* auth 首帧已携带 task_ids；无 listening/麦克风上传，等待智能体下行音频。 */
-                    app_state_set(APP_STATE_PLAYING);
-                    reminder_requested = true;
-                    ESP_LOGI(TAG, "Reminder session authenticated; waiting for agent audio: task_count=%u",
-                             reminder_task->count);
-                    break;
-                }
                 ESP_LOGI(TAG, "WebSocket authenticated; audio upload ready");
-                conversation_active = true;
-                resume_listening(false, resume_deadline_ms ? "reconnect" : "wake connect complete");
+                start_audio_session(reminder_task ? "MQTT wake" : "wake/reconnect");
                 break;
             case EV_WS_DISCONNECTED:
                 recover_session("WebSocket transport disconnected");
@@ -650,51 +639,10 @@ static void main_task(void *arg)
                 recover_session("audio upload failed");
                 break;
             case EV_AUDIO_WAKE_DETECTED:
-                start_conversation("wake word");
-                break;
-            case EV_AUDIO_SPEECH_START:
-                if (conversation_active && current_state == APP_STATE_LISTENING)
-                    app_state_reset_silence_timer();
-                break;
-            case EV_WS_SPEECH_STARTED:
-            case EV_WS_RESPONSE_INTERRUPTED:
-                process_platform_interruption();
-                if (conversation_active && app_state_get() == APP_STATE_LISTENING)
-                    app_state_reset_silence_timer();
-                break;
-            case EV_WS_SPEECH_STOPPED:
-            case EV_WS_RESPONSE_CONTINUED:
-                /* worker 已设播放门；下方轮询当前 offer，麦克风始终上传。 */
-                break;
-            case EV_AUDIO_OUT_START:
-                if ((conversation_active || (reminder_task && reminder_requested)) &&
-                    current_state == APP_STATE_PLAYING &&
-                    ws_service_get_state() == WS_STATE_CONNECTED) {
-                    if (conversation_active) response_deadline_ms = now_ms() + 180000;
-                    led_set_speaking();
+                if (!session_requested) {
+                    device_mqtt_service_on_wake();
+                    start_conversation("wake word");
                 }
-                break;
-            case EV_WS_RESPONSE_DONE:
-                if (reminder_task && reminder_requested) {
-                    /* 事件排队期间可能已有下一段 created；不能提前确认整批任务。 */
-                    if (!ws_service_reply_finished()) break;
-                    /* 只有音频边界完成且 PCM 排空后，服务才允许持久化并回执。 */
-                    device_mqtt_service_finish_tasks(reminder_task, DEVICE_TASK_AUDIO_RECEIVED);
-                    reminder_task = NULL;
-                    end_conversation("reminder playback completed");
-                    break;
-                }
-                if (conversation_active && current_state == APP_STATE_PLAYING &&
-                    ws_service_reply_finished()) {
-                    ESP_LOGI(TAG, "Reply complete; continue conversation");
-                    resume_listening(true, "reply completed");
-                }
-                break;
-            case EV_AUDIO_SILENCE_TIMEOUT:
-                /* Ignore an already queued timeout from before playback. */
-                if (current_state != APP_STATE_LISTENING) break;
-                if (esp_timer_is_active(app_state_get_global()->silence_timer)) break;
-                end_conversation("60s silence timeout");
                 break;
             case EV_AUDIO_INPUT_ERROR:
                 recover_session("audio input error");
@@ -703,28 +651,25 @@ static void main_task(void *arg)
             }
         }
         int64_t now = now_ms();
+        if (cleanup_pending && now >= cleanup_at_ms) stop_session_audio();
         device_handshake_service_poll(wifi_service_get_state() == WIFI_STATE_GOT_IP &&
                                       !provisioning_service_is_active());
         device_mqtt_service_set_dispatch_allowed(
             wifi_service_get_state() == WIFI_STATE_GOT_IP &&
-            !provisioning_service_is_active() && !session_requested &&
-            app_state_get() == APP_STATE_WAIT_WAKE);
+            !provisioning_service_is_active() && !cleanup_pending && !reminder_task &&
+            (!session_requested || conversation_active));
         device_mqtt_service_poll(device_handshake_service_is_enabled() && !device_handshake_service_is_blocked() &&
             wifi_service_get_state() == WIFI_STATE_GOT_IP && !provisioning_service_is_active(),
             device_handshake_service_mqtt_epoch(), device_handshake_service_get_configuration());
         poll_reminder();
-        process_reply_offer();
+        poll_conversation();
         save_volume_if_due(now);
         save_brightness_if_due(now);
         update_ui_snapshot(now);
         if (resume_deadline_ms && now >= resume_deadline_ms) {
             end_conversation("conversation recovery expired");
         }
-        if (response_deadline_ms && now >= response_deadline_ms) {
-            ws_service_log_response_wait();
-            recover_session("server reply timed out");
-        }
-        else if (auth_deadline_ms && now >= auth_deadline_ms) {
+        if (auth_deadline_ms && now >= auth_deadline_ms) {
             if (awaiting_voice_auth) handle_voice_auth_failure("gateway authentication timed out");
             else recover_session("WebSocket connection timed out");
         }

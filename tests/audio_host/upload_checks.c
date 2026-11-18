@@ -118,7 +118,7 @@ int opus_enc_encode(opus_enc_handle_t encoder, const int16_t *pcm, int bytes,
 }
 int wake_word_get_chunksize(void) { return 512; }
 void wake_word_get_audio_progress(wake_word_audio_progress_t *p)
-{ *p = (wake_word_audio_progress_t){29184, produced, 24000}; }
+{ *p = (wake_word_audio_progress_t){29184, produced, 24000, 1234}; }
 size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
 {
     CHECK(capacity == 1024);
@@ -147,9 +147,11 @@ static void run_upload(unsigned failure, bool partial, bool stop)
     fail_packet = failure; pause_partial = partial; stopped_while_paused = stop;
     active_input = audio_in_create(NULL);
     CHECK(active_input != NULL);
+    CHECK(audio_in_get_last_voice_ms(active_input)==0);
     CHECK(active_input->vad_buf == NULL && active_input->vad_buf_cap == 0);
     CHECK(audio_in_start_from_ringbuf(active_input, (void *)1) == ESP_OK);
     CHECK(wifi_audio_active);
+    CHECK(audio_in_get_last_voice_ms(active_input)==1234);
     task_entry(task_argument);
     if (!failure && !stop) {
         CHECK(encoded == 29120 && packets == 91);

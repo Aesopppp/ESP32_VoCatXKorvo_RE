@@ -11,15 +11,6 @@ static bool task_id_valid(const char *id)
     return true;
 }
 
-static bool stored_id_valid(const char *id)
-{
-    if (!id || !*id || strlen(id) > DEVICE_TASK_ID_MAX) return false;
-    for (const unsigned char *p = (const unsigned char *)id; *p; ++p)
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') || strchr("_.:-", *p))) return false;
-    return true;
-}
-
 bool device_mqtt_parse_task(const char *json, size_t length, device_mqtt_task_t *task)
 {
     if (!json || !task || !length || length > DEVICE_TASK_PAYLOAD_MAX) return false;
@@ -61,8 +52,6 @@ bool device_mqtt_parse_task(const char *json, size_t length, device_mqtt_task_t 
          cJSON_IsString(fire) && device_handshake_parse_time(fire->valuestring, &unused_time);
     if (ok) {
         strcpy(task->id, id->valuestring);
-        memcpy(task->payload, json, length);
-        task->payload[length] = 0;
     }
     cJSON_Delete(root);
     return ok;
@@ -88,36 +77,6 @@ device_mqtt_fragment_result_t device_mqtt_assemble(device_mqtt_assembly_t *s,
     return DEVICE_MQTT_FRAGMENT_COMPLETE;
 }
 
-void device_mqtt_history_init(device_mqtt_history_t *h, const char *device_id)
-{
-    memset(h, 0, sizeof(*h));
-    h->version = 1;
-    if (device_handshake_id_valid(device_id)) strcpy(h->device_id, device_id);
-}
-bool device_mqtt_history_valid(const device_mqtt_history_t *h, const char *device_id)
-{
-    if (h->version != 1 || h->next >= DEVICE_TASK_HISTORY_SIZE ||
-        !memchr(h->device_id, 0, sizeof(h->device_id)) || strcmp(h->device_id, device_id)) return false;
-    for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i)
-        if (!memchr(h->ids[i], 0, sizeof(h->ids[i])) ||
-            (h->ids[i][0] && !stored_id_valid(h->ids[i]))) return false;
-    return true;
-}
-int device_mqtt_history_find(const device_mqtt_history_t *h, const char *id)
-{
-    for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i)
-        if (id && *id && !strcmp(h->ids[i], id)) return (int)i;
-    return -1;
-}
-unsigned device_mqtt_history_add(device_mqtt_history_t *h, const char *id)
-{
-    int found = device_mqtt_history_find(h, id);
-    if (found >= 0) return (unsigned)found;
-    unsigned index = h->next;
-    strcpy(h->ids[index], id); /* 调用方只传经过 parse_task 校验的 ID。 */
-    h->next = (index + 1) % DEVICE_TASK_HISTORY_SIZE;
-    return index;
-}
 void device_mqtt_retry_failed(device_mqtt_retry_t *s, int connack, int64_t now, uint32_t random)
 {
     if (s->failures < 7) ++s->failures;

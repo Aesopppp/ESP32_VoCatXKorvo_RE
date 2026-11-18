@@ -192,78 +192,69 @@ static void connect_ok(void) {
     signal_event(MQTT_EVENT_PUBLISHED,worker->status_id,0);
 }
 
+
 static void storage_recovery_checks(void)
 {
     mqtt_worker_t *w=calloc(1,sizeof(*w)), *boot=calloc(1,sizeof(*boot));
     w->settings=worker->settings; boot->settings=w->settings;
-    w->client=(void*)1; w->connected=w->storage_ready=true;
+    w->storage_ready=true;
     memset(blobs,0,sizeof(blobs)); entry_budget=10000;
-    device_mqtt_history_init(&w->history,"dev-1");
-    device_mqtt_history_add(&w->history,"000021");
-    pending_init(&w->pending,"dev-1"); w->pending.count=2;
+    pending_init(&w->pending,w->settings.config.username); w->pending.count=2;
     strcpy(w->pending.entries[0].id,"000021"); strcpy(w->pending.entries[1].id,"000022");
     w->pending.entries[1].received_at=1790000000;
-    CHECK(save_blob("played_v1",&w->history,sizeof(w->history))==ESP_OK);
+    w->pending.entries[0].state=2; w->pending.entries[0].failure_pending=1;
     CHECK(save_blob("pending_v1",&w->pending,sizeof(w->pending))==ESP_OK);
-    entry_budget=used_entries()+16; /* 仅剩约 512 字节；重现整块重写空间不足。 */
-    CHECK(save_blob("played_v1",&w->history,sizeof(w->history))==ESP_ERR_NVS_NOT_ENOUGH_SPACE);
-    CHECK(load_history(w) && load_pending(w));
-    CHECK(w->dirty && w->pending_dirty && w->pending.count==1);
-    CHECK(!strcmp(w->pending.entries[0].id,"000022"));
-    fail_commit=true; persist_state(w);
-    CHECK(w->dirty && blobs[0].length==sizeof(w->history) && blobs[1].length==sizeof(w->pending));
-    unsigned before=acks; publish_ack(w); CHECK(acks==before);
+    entry_budget=used_entries()+12;
+    CHECK(save_blob("pending_v1",&w->pending,sizeof(w->pending))==ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    CHECK(load_pending(w) && w->pending_dirty && w->pending.count==2);
+    CHECK(!w->pending.entries[0].state && !w->pending.entries[0].failure_pending);
+    fail_commit=true; persist_state(w); CHECK(w->pending_dirty);
+    CHECK(blobs[1].length==sizeof(w->pending)); /* 迁移写失败仍能从旧记录重启。 */
+    CHECK(load_pending(boot) && boot->pending.count==2);
     fail_commit=false; fake_now+=5000; persist_state(w);
-    CHECK(!w->dirty && !w->pending_dirty && blobs[0].length<100 && blobs[1].length<100);
-    CHECK(load_history(boot) && load_pending(boot));
-    CHECK(!boot->dirty && !boot->pending_dirty && boot->pending.count==1);
-    CHECK(boot->pending.entries[0].received_at==1790000000);
-    CHECK(device_mqtt_history_find(&boot->history,"000021")>=0);
+    CHECK(!w->pending_dirty && !memcmp(blobs[1].bytes,"MQP2",4) && blobs[1].length<100);
+    memset(&boot->pending,0,sizeof(boot->pending)); boot->pending_dirty=false;
+    CHECK(load_pending(boot) && !boot->pending_dirty && boot->pending.count==2);
+    CHECK(!strcmp(boot->pending.entries[0].id,"000021"));
 
-    /* 第一键已提交、第二键失败后重启：已成功任务不会再次进入待播。 */
-    device_mqtt_history_add(&w->history,"000022"); w->dirty=true; pending_remove(w,0);
-    fail_commit_slot=1; persist_state(w);
-    CHECK(!w->dirty && w->pending_dirty);
-    CHECK(load_history(boot) && load_pending(boot) && !boot->pending.count && boot->pending_dirty);
-    CHECK(device_mqtt_history_find(&boot->history,"000022")>=0);
-    persist_state(boot); CHECK(boot->pending_dirty); /* 对账失败仍可再次重试。 */
-    fail_commit_slot=-1; fake_now+=5000; persist_state(boot); persist_state(w);
-    CHECK(!boot->pending_dirty && !w->pending_dirty);
-
-    /* 即使紧凑记录也无空间时保留持久数据，不发送回执；有空间后自动恢复。 */
-    device_mqtt_history_add(&w->history,"000023"); w->dirty=true;
-    entry_budget=used_entries(); before=acks;
-    persist_state(w); publish_ack(w); CHECK(w->dirty && acks==before);
-    unsigned failures=space_failures; persist_state(w); CHECK(space_failures==failures);
-    CHECK(load_history(boot) && device_mqtt_history_find(&boot->history,"000023")<0);
-    entry_budget=64; fake_now+=5000; persist_state(w); CHECK(!w->dirty);
-
-    /* 约 2 KiB 预算覆盖多轮真实服务写入及历史环绕，不能随任务次数无限增长。 */
+    /* 通知消费保存失败：当前启动不重复交接；掉电可能恢复旧通知，由平台去重。 */
+    w->pending.count=0; w->pending_dirty=true; fail_commit=true;
+    w->persist_at=0; persist_state(w); CHECK(w->pending_dirty);
+    CHECK(load_pending(boot) && boot->pending.count==2);
+    fail_commit=false; fake_now+=5000; persist_state(w);
+    CHECK(!w->pending_dirty && load_pending(boot) && !boot->pending.count);
     for(unsigned i=0;i<200;++i) {
-        char id[16]; snprintf(id,sizeof(id),"%06u",1000+i);
-        w->pending.count=1; memset(w->pending.entries,0,sizeof(w->pending.entries));
-        strcpy(w->pending.entries[0].id,id); w->pending_dirty=true; persist_state(w);
-        CHECK(!w->pending_dirty);
-        device_mqtt_history_add(&w->history,id); w->dirty=true; pending_remove(w,0); persist_state(w);
-        CHECK(!w->dirty && !w->pending_dirty);
+        w->pending.count=1; snprintf(w->pending.entries[0].id,sizeof(w->pending.entries[0].id),"%u",i);
+        w->pending_dirty=true; persist_state(w);
+        CHECK(!w->pending_dirty && load_pending(boot) && boot->pending.count==1);
+        w->pending.count=0; w->pending_dirty=true; persist_state(w);
+        CHECK(!w->pending_dirty && load_pending(boot) && !boot->pending.count);
     }
-    CHECK(load_history(boot) && load_pending(boot) && !boot->pending.count);
-    CHECK(device_mqtt_history_find(&boot->history,"001199")>=0);
-    CHECK(device_mqtt_history_find(&boot->history,"001168")>=0);
-    CHECK(device_mqtt_history_find(&boot->history,"001167")<0);
-    /* 损坏数据不能被误当作空队列继续执行。 */
     blobs[1].length=4; CHECK(!load_pending(boot));
-    blobs[0].bytes[4]=DEVICE_TASK_HISTORY_SIZE; CHECK(!load_history(boot));
     entry_budget=10000; free(w); free(boot);
 }
+
+static device_mqtt_delivery_t *claim(void)
+{
+    device_mqtt_service_set_dispatch_allowed(true); step();
+    device_mqtt_delivery_t *tasks=device_mqtt_service_take_tasks();
+    CHECK(tasks!=NULL);
+    return tasks;
+}
+
+static void release(device_mqtt_delivery_t *tasks,bool handled)
+{
+    device_mqtt_service_set_dispatch_allowed(false);
+    device_mqtt_service_release_tasks(tasks,handled); step();
+}
+
 int main(void)
 {
 #ifdef TEST_NO_CA
     CHECK(device_mqtt_service_init()==ESP_ERR_NOT_FOUND);
     device_mqtt_service_poll(true,1,&config);
     CHECK(!device_mqtt_service_voice_enabled() && !device_mqtt_service_take_tasks() && !starts);
-    printf("Device MQTT missing-CA guard: %u checks passed\n",checks);
-    return 0;
+    printf("Device MQTT missing-CA guard: %u checks passed\n",checks); return 0;
 #endif
     strcpy(config.mqtt.endpoint,"mqtts://broker.example:8883");
     strcpy(config.mqtt.username,"dev-1");
@@ -271,8 +262,7 @@ int main(void)
     strcpy(config.mqtt.password,"test-only");
     strcpy(config.mqtt.publish_topic,"devices/dev-1/status");
     strcpy(config.mqtt.subscribe_topic,"devices/dev-1/task");
-    CHECK(device_mqtt_service_init()==ESP_OK);
-    worker=worker_argument;
+    CHECK(device_mqtt_service_init()==ESP_OK); worker=worker_argument;
     device_mqtt_service_poll(true,1,&config); step();
     CHECK(starts==1 && worker->storage_ready);
     CHECK(observed.session.protocol_ver==MQTT_PROTOCOL_V_3_1_1 && observed.session.keepalive==60);
@@ -280,7 +270,6 @@ int main(void)
     CHECK(observed.broker.verification.certificate && !observed.broker.verification.skip_cert_common_name_check);
     CHECK(!strcmp(observed.credentials.client_id,"issued-id"));
     connect_ok(); CHECK(publishes==1 && subscriptions==1);
-    /* 首次/周期状态均使用握手主题；实际字段可供平台在线页和版本页使用。 */
     CHECK(!strcmp(last_topic,config.mqtt.publish_topic));
     cJSON *status=cJSON_Parse(last_payload);
     CHECK(status && cJSON_GetArraySize(status)==4);
@@ -288,106 +277,59 @@ int main(void)
     CHECK(!strcmp(cJSON_GetObjectItem(status,"board")->valuestring,"esp-vocat-v1.2"));
     CHECK(!strcmp(cJSON_GetObjectItem(status,"ip")->valuestring,"192.0.2.1"));
     CHECK(cJSON_GetObjectItem(status,"rssi")->valueint==-50);
-    CHECK(!cJSON_GetObjectItem(status,"ts"));
-    cJSON_Delete(status);
+    CHECK(!cJSON_GetObjectItem(status,"ts")); cJSON_Delete(status);
     fake_now+=59999; step(); CHECK(publishes==1);
     fake_now+=1; step(); CHECK(publishes==2);
-    step(); CHECK(publishes==2); /* 未收到 PUBACK，不堆积状态。 */
+    step(); CHECK(publishes==2);
     signal_event(MQTT_EVENT_PUBLISHED,worker->status_id,0);
-    device_mqtt_service_poll(true,1,NULL); step(); CHECK(stops==0 && starts==1); /* WS 续期不重连 MQTT */
+    device_mqtt_service_poll(true,1,NULL); step(); CHECK(stops==0 && starts==1);
+
     const char *fragmented=" {\"task_id\":\"10\",\"kind\":\"reminder\","
         "\"content\":\"请按原文播报：\\\"午饭\\\"\\n时间到了\",\"fire_at\":\"2020-01-01T01:02:03.000Z\"} ";
     receive_fragmented_task(fragmented);
     CHECK(worker->pending.count==1 && !worker->active && blobs[1].present && acks==0);
     CHECK(!strcmp(worker->pending.entries[0].id,"10") && worker->pending.entries[0].received_at>0);
     receive_task("11"); receive_task("10");
-    CHECK(worker->pending.count==2 && !worker->active && acks==0);
-    receive_task("task-12"); CHECK(worker->pending.count==2); /* 数字串之外不建立会话。 */
+    CHECK(worker->pending.count==3 && !worker->active); /* 重复业务交由平台处理。 */
+    receive_task("task-12"); CHECK(worker->pending.count==3);
     mqtt_worker_t *reboot=calloc(1,sizeof(*reboot)); reboot->settings=worker->settings;
-    CHECK(load_history(reboot) && load_pending(reboot) && reboot->pending.count==2);
-    CHECK(reboot->pending.entries[0].received_at==worker->pending.entries[0].received_at);
-    CHECK(!strcmp(reboot->pending.entries[1].id,"11")); free(reboot);
+    CHECK(load_pending(reboot) && reboot->pending.count==3);
+    CHECK(reboot->pending.entries[0].received_at==worker->pending.entries[0].received_at); free(reboot);
 #if !DEVICE_MQTT_FORWARD_TASK_TO_WS
     device_mqtt_service_set_dispatch_allowed(true); step();
     CHECK(!device_mqtt_service_voice_enabled() && !device_mqtt_service_take_tasks() && acks==0);
     printf("Device MQTT disabled-voice guard: %u checks passed\n",checks); return 0;
 #endif
-    /* 主任务空闲后才领取全部排队编号，内容不进入 WS 请求。 */
-    CHECK(device_mqtt_service_voice_enabled() && !device_mqtt_service_take_tasks());
-    device_mqtt_service_set_dispatch_allowed(true); step();
-    device_mqtt_delivery_t *tasks=device_mqtt_service_take_tasks();
-    CHECK(tasks && tasks->count==2 && !strcmp(tasks->task_ids[0],"10") && !strcmp(tasks->task_ids[1],"11"));
-    CHECK(!device_mqtt_service_take_tasks() && worker->pending.count==2);
+    /* 已有会话可以立即领取；不需要等播放结束，服务不生成语音请求或播放ACK。 */
+    device_mqtt_delivery_t *tasks=claim();
+    CHECK(tasks->count==3 && !strcmp(tasks->task_ids[0],"10") && !strcmp(tasks->task_ids[2],"10"));
+    CHECK(!device_mqtt_service_take_tasks());
     device_mqtt_service_set_dispatch_allowed(false);
-    receive_task("10"); receive_task("12"); CHECK(worker->pending.count==3);
-    fail_commit=true; device_mqtt_service_finish_tasks(tasks,DEVICE_TASK_AUDIO_RECEIVED); step();
-    CHECK(worker->dirty && worker->pending_dirty && acks==0 && !worker->active);
-    /* 成功记录尚未落盘，不发布成功回执，也不开始下一批。 */
+    receive_task("10"); receive_task("12"); CHECK(worker->pending.count==5);
+    fail_commit=true; release(tasks,true);
+    CHECK(worker->pending_dirty && worker->pending.count==2 && !worker->active && acks==0);
     device_mqtt_service_set_dispatch_allowed(true); step(); CHECK(!worker->active);
     device_mqtt_service_set_dispatch_allowed(false);
-    fail_commit=false; fake_now+=5000; step();
-    CHECK(!worker->dirty && !worker->pending_dirty && worker->pending.count==1 && acks==1);
-    cJSON *ack=cJSON_Parse(last_payload); CHECK(ack!=NULL);
-    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(ack,"audio_received")));
-    CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(ack,"task_ids"))==2);
-    CHECK(!cJSON_GetObjectItem(ack,"task_id")); cJSON_Delete(ack);
-    int first=device_mqtt_history_find(&worker->history,"10");
-    int second=device_mqtt_history_find(&worker->history,"11");
-    CHECK(first>=0 && second>=0 && worker->ack_ids[first]==worker->ack_ids[second]);
-    int old_ack=worker->ack_ids[first]; fake_now+=45000; step();
-    CHECK(worker->ack_ids[first]!=old_ack);
-    signal_event(MQTT_EVENT_PUBLISHED,old_ack,0); CHECK(worker->ack_pending[first]);
-    signal_event(MQTT_EVENT_PUBLISHED,worker->ack_ids[first],0);
-    CHECK(!worker->ack_pending[first] && !worker->ack_pending[second]);
-    reboot=calloc(1,sizeof(*reboot)); reboot->settings=worker->settings;
-    CHECK(load_history(reboot) && load_pending(reboot));
-    CHECK(reboot->pending.count==1 && !strcmp(reboot->pending.entries[0].id,"12"));
-    CHECK(device_mqtt_history_find(&reboot->history,"10")>=0); free(reboot);
-    fake_now+=100; receive_task("10"); CHECK(worker->pending.count==1 && !worker->active);
-    signal_event(MQTT_EVENT_PUBLISHED,worker->ack_ids[first],0);
+    fail_commit=false; fake_now+=5000; step(); CHECK(!worker->pending_dirty);
+    tasks=claim(); CHECK(tasks->count==2 && !strcmp(tasks->task_ids[0],"10") && !strcmp(tasks->task_ids[1],"12"));
+    release(tasks,true); CHECK(!worker->pending.count && acks==0);
+    /* 没有成功历史：同编号再次投递，仍通知主任务。 */
+    receive_task("10"); tasks=claim(); CHECK(tasks->count==1); release(tasks,true);
 
-    /* 失败回执为 false；服务端重投可在 PUBACK 前到达，不能被迟到确认删除。 */
-    device_mqtt_service_set_dispatch_allowed(true); step(); tasks=device_mqtt_service_take_tasks();
-    CHECK(tasks && tasks->count==1 && !strcmp(tasks->task_ids[0],"12"));
-    device_mqtt_service_set_dispatch_allowed(false); fake_now+=100;
-    device_mqtt_service_finish_tasks(tasks,DEVICE_TASK_FAILED); step();
-    CHECK(worker->pending.entries[0].failure_pending && worker->pending.entries[0].state==TASK_WAIT_PLATFORM);
-    CHECK(strstr(last_payload,"false") && strstr(last_payload,"12"));
-    int failed_ack=worker->failure_ids[0]; CHECK(failed_ack>=0);
-    device_mqtt_service_set_dispatch_allowed(true); step(); CHECK(!worker->active);
-    receive_task("12"); CHECK(!worker->active && worker->pending.entries[0].state==TASK_READY);
-    signal_event(MQTT_EVENT_PUBLISHED,failed_ack,0); tasks=device_mqtt_service_take_tasks();
-    CHECK(tasks && tasks->count==1 && !strcmp(tasks->task_ids[0],"12"));
-    device_mqtt_service_set_dispatch_allowed(false); fake_now+=100;
-    device_mqtt_service_finish_tasks(tasks,DEVICE_TASK_FAILED); step();
-    failed_ack=worker->failure_ids[0]; signal_event(MQTT_EVENT_PUBLISHED,failed_ack,0);
-    CHECK(!worker->pending.count);
-    device_mqtt_service_set_dispatch_allowed(true); fake_now+=120000; step(); CHECK(!worker->active);
-    /* 无音频失败之后设备绝不根据本地计时器重播。 */
-
-    device_mqtt_service_set_dispatch_allowed(false); receive_task("13");
-    device_mqtt_service_set_dispatch_allowed(true); step(); tasks=device_mqtt_service_take_tasks(); CHECK(tasks!=NULL);
-    device_mqtt_service_set_dispatch_allowed(false);
+    /* 失败保留通知，不能按时间自动无限唤醒；真实用户唤醒重新允许。 */
+    receive_task("13"); tasks=claim(); release(tasks,false);
+    CHECK(worker->pending.count==1 && worker->dispatch_paused);
+    device_mqtt_service_set_dispatch_allowed(true); fake_now+=1000; step();
+    CHECK(!worker->active && !device_mqtt_service_take_tasks());
+    device_mqtt_service_on_wake(); tasks=claim(); release(tasks,false);
     device_mqtt_service_poll(false,2,NULL); step(); CHECK(!worker->client);
-    unsigned offline_acks=acks;
-    device_mqtt_service_finish_tasks(tasks,DEVICE_TASK_NETWORK_WAIT); step();
-    CHECK(worker->pending.entries[0].state==TASK_WAIT_NETWORK && worker->pending.entries[0].failure_pending);
-    CHECK(acks==offline_acks);
-    reboot=calloc(1,sizeof(*reboot)); reboot->settings=worker->settings;
-    strcpy(reboot->settings.config.username,"dev-1");
-    CHECK(load_history(reboot) && load_pending(reboot));
-    CHECK(reboot->pending.count==1 && reboot->pending.entries[0].failure_pending &&
-          reboot->pending.entries[0].state==TASK_READY); free(reboot);
-    device_mqtt_service_poll(true,3,&config); step(); connect_ok(); fake_now+=100; step();
-    CHECK(worker->pending.entries[0].state==TASK_READY && acks>offline_acks);
-    signal_event(MQTT_EVENT_PUBLISHED,worker->failure_ids[0],0);
-    device_mqtt_service_set_dispatch_allowed(true); step(); tasks=device_mqtt_service_take_tasks(); CHECK(tasks!=NULL);
-    device_mqtt_service_set_dispatch_allowed(false);
-    device_mqtt_service_finish_tasks(tasks,DEVICE_TASK_AUDIO_RECEIVED); fake_now+=100; step();
-    for(unsigned i=0;i<DEVICE_TASK_HISTORY_SIZE;++i)
-        if(worker->ack_ids[i]>=0) signal_event(MQTT_EVENT_PUBLISHED,worker->ack_ids[i],0);
+    device_mqtt_service_poll(true,3,&config); step(); connect_ok();
+    CHECK(!worker->dispatch_paused);
+    tasks=claim(); release(tasks,false);
+    receive_task("14"); tasks=claim(); CHECK(tasks->count==2); release(tasks,true);
 
-    /* 订阅拒绝不引发重连风暴；不接收 retained 或错误主题。 */
+    /* 用户取消使用 handled=true，只消费通知，仍无播放结果上报。 */
+    receive_task("15"); tasks=claim(); release(tasks,true); CHECK(!worker->pending.count && acks==0);
     unsigned old_stops=stops;
     mock_event_t e={.msg_id=worker->subscribe_id,.data="\200",.data_len=1};
     mqtt_event(worker,0,MQTT_EVENT_SUBSCRIBED,&e); step(); CHECK(worker->subscription_rejected && stops==old_stops);
@@ -399,43 +341,39 @@ int main(void)
     e.retain=0; e.topic="devices/other/task"; e.topic_len=(int)strlen(e.topic);
     mqtt_event(worker,0,MQTT_EVENT_DATA,&e); step(); CHECK(!worker->pending.count);
 
-    /* 持久化失败时不领取；修复后保存并恢复。 */
-    fail_commit=true; receive_task("20");
-    CHECK(worker->pending_dirty && !worker->active);
+    fail_commit=true; receive_task("20"); CHECK(worker->pending_dirty && !worker->active);
     device_mqtt_service_set_dispatch_allowed(true); step(); CHECK(!worker->active);
-    device_mqtt_service_set_dispatch_allowed(false);
-    fail_commit=false; fake_now+=5000; step(); CHECK(!worker->pending_dirty);
+    device_mqtt_service_set_dispatch_allowed(false); fail_commit=false; fake_now+=5000; step();
     for(unsigned i=21;i<29;++i) { char id[20]; snprintf(id,sizeof(id),"%u",i); receive_task(id); }
     CHECK(worker->pending.count==8); receive_task("21"); CHECK(worker->pending.count==8);
-    device_mqtt_service_set_dispatch_allowed(true); step(); tasks=device_mqtt_service_take_tasks();
-    CHECK(tasks && tasks->count==8 && !strcmp(tasks->task_ids[7],"27"));
-    device_mqtt_service_set_dispatch_allowed(false);
-    device_mqtt_service_finish_tasks(tasks,DEVICE_TASK_AUDIO_RECEIVED); fake_now+=100; step();
-    CHECK(!worker->pending.count && strstr(last_payload,"27") && strstr(last_payload,"true"));
-    for(unsigned i=0;i<DEVICE_TASK_HISTORY_SIZE;++i)
-        if(worker->ack_ids[i]>=0) signal_event(MQTT_EVENT_PUBLISHED,worker->ack_ids[i],0);
+    tasks=claim(); CHECK(tasks->count==8 && !strcmp(tasks->task_ids[7],"27"));
+    release(tasks,true); CHECK(!worker->pending.count);
 
-    /* worker 刚准备批次、主任务尚未领取时用户先唤醒；挂断后重新合并。 */
-    device_mqtt_service_set_dispatch_allowed(true); receive_task("90");
-    CHECK(worker->active && worker->active->count==1);
+    /* 连接期间门禁关闭，只回收未领取快照；连接完成后一次取所有新通知。 */
+    device_mqtt_service_set_dispatch_allowed(true); receive_task("90"); CHECK(worker->active);
     device_mqtt_service_set_dispatch_allowed(false); receive_task("91");
     CHECK(!worker->active && worker->pending.count==2 && !device_mqtt_service_take_tasks());
-    device_mqtt_service_set_dispatch_allowed(true); step(); tasks=device_mqtt_service_take_tasks();
-    CHECK(tasks && tasks->count==2 && !strcmp(tasks->task_ids[1],"91"));
-    device_mqtt_service_set_dispatch_allowed(false); step(); CHECK(worker->active==tasks);
-    device_mqtt_service_finish_tasks(tasks,DEVICE_TASK_AUDIO_RECEIVED); fake_now+=100; step();
-    CHECK(!worker->pending.count);
-    for(unsigned i=0;i<DEVICE_TASK_HISTORY_SIZE;++i)
-        if(worker->ack_ids[i]>=0) signal_event(MQTT_EVENT_PUBLISHED,worker->ack_ids[i],0);
+    tasks=claim(); CHECK(tasks->count==2); device_mqtt_service_set_dispatch_allowed(false); step();
+    CHECK(worker->active==tasks); release(tasks,true);
 
+    /* 身份改变 A -> B -> A 后，旧借用对象不能删去当前身份重新加载的同 ID 通知。 */
+    receive_task("92"); tasks=claim(); device_mqtt_service_set_dispatch_allowed(false);
+    unsigned old_serial=worker->identity_serial;
+    strcpy(config.mqtt.username,"dev-2"); device_mqtt_service_poll(true,4,&config); step();
+    strcpy(config.mqtt.username,"dev-1"); device_mqtt_service_poll(true,5,&config); step();
+    CHECK(worker->identity_serial==old_serial+2 && worker->pending.count==1);
+    release(tasks,true); CHECK(worker->pending.count==1);
+    tasks=claim(); release(tasks,true);
+    connect_ok();
     for(unsigned i=1;i<=5;++i) {
         signal_event(MQTT_EVENT_ERROR,0,5); CHECK(worker->retry.auth_failures==i && worker->retry.blocked==(i==5));
         signal_event(MQTT_EVENT_DISCONNECTED,0,0); CHECK(worker->retry.auth_failures==i);
         fake_now=worker->retry.retry_at_ms; step();
     }
     CHECK(!worker->client);
-    device_mqtt_service_poll(false,4,NULL); step(); device_mqtt_service_poll(true,5,&config); step();
+    device_mqtt_service_poll(false,6,NULL); step(); device_mqtt_service_poll(true,7,&config); step();
     CHECK(!worker->client); device_mqtt_service_on_wake(); step(); CHECK(worker->client && !worker->retry.blocked);
+    CHECK(acks==0);
     storage_recovery_checks();
     printf("Device MQTT service: %u checks passed\n",checks); return 0;
 }

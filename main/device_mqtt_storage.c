@@ -1,11 +1,9 @@
 #include "device_mqtt_storage.h"
 #include <string.h>
 
-/* v2：4 字节魔数 + 1 字节 next/count + NUL 结尾的设备 ID。
- * history 按原环形槽位存 32 个 NUL 字符串，空槽只占 1 字节。
- * pending 只存 count 条：ID + 8 字节小端 Unix 秒 + state + failure_pending。
- * 无结构体 padding，不写空槽预留空间；最长 ID 和历史容量保持不变。
- * NVS 自身提供 CRC 与单键替换，不另外维护容易失步的长度/校验副本。 */
+/* MQP2 保留原有二进制布局，兼容旧固定结构体和紧凑记录。
+ * 只存实际通知 ID/时间；两个旧状态字节写 0，避免重引入播放结果概念。
+ * NVS 提供单键替换，不依赖多键事务，也不清除旧成功记录和其他配置。 */
 static bool put_string(uint8_t **cursor, const uint8_t *end, const char *value, size_t capacity)
 {
     const char *nul = memchr(value, 0, capacity);
@@ -27,19 +25,6 @@ static bool get_string(const uint8_t **cursor, const uint8_t *end, char *value, 
     return true;
 }
 
-size_t device_mqtt_storage_encode_history(const device_mqtt_history_t *h, void *data, size_t capacity)
-{
-    if (!h || !data || capacity < 5 || h->version != 1 || h->next >= DEVICE_TASK_HISTORY_SIZE) return 0;
-    uint8_t *start = data, *p = start + 5;
-    const uint8_t *end = start + capacity;
-    memcpy(start, "MQH2", 4);
-    start[4] = (uint8_t)h->next;
-    if (!put_string(&p, end, h->device_id, sizeof(h->device_id))) return 0;
-    for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i)
-        if (!put_string(&p, end, h->ids[i], sizeof(h->ids[i]))) return 0;
-    return (size_t)(p - start);
-}
-
 size_t device_mqtt_storage_encode_pending(const mqtt_pending_store_t *pending, void *data, size_t capacity)
 {
     if (!pending || !data || capacity < 5 || pending->version != MQTT_PENDING_VERSION ||
@@ -55,31 +40,10 @@ size_t device_mqtt_storage_encode_pending(const mqtt_pending_store_t *pending, v
             (size_t)(end - p) < 10) return 0;
         uint64_t seconds = (uint64_t)entry->received_at;
         for (unsigned j = 0; j < 8; ++j) *p++ = (uint8_t)(seconds >> (j * 8));
-        *p++ = entry->state;
-        *p++ = entry->failure_pending;
+        *p++ = 0;
+        *p++ = 0;
     }
     return (size_t)(p - start);
-}
-
-bool device_mqtt_storage_decode_history(const void *data, size_t size, device_mqtt_history_t *h, bool *legacy)
-{
-    if (!data || !h || !legacy || size < 5) return false;
-    *legacy = false;
-    if (memcmp(data, "MQH2", 4)) {
-        if (size != sizeof(*h)) return false;
-        memcpy(h, data, size);
-        *legacy = h->version == 1;
-        return *legacy;
-    }
-    const uint8_t *start = data, *p = start + 5, *end = start + size;
-    memset(h, 0, sizeof(*h));
-    h->version = 1;
-    h->next = start[4];
-    if (h->next >= DEVICE_TASK_HISTORY_SIZE ||
-        !get_string(&p, end, h->device_id, sizeof(h->device_id))) return false;
-    for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i)
-        if (!get_string(&p, end, h->ids[i], sizeof(h->ids[i]))) return false;
-    return p == end;
 }
 
 bool device_mqtt_storage_decode_pending(const void *data, size_t size, mqtt_pending_store_t *pending, bool *legacy)

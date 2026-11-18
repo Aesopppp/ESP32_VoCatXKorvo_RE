@@ -9,7 +9,7 @@
 #include "cJSON.h"
 static unsigned checks, sent;
 static int state = WS_STATE_CONNECTED;
-static bool reminder_mode, fail_base64, fail_send, reenter;
+static bool fail_base64, fail_send, reenter;
 static const uint8_t *expected_data;
 static size_t expected_len;
 static char expected_audio[345];
@@ -56,8 +56,9 @@ int main(void)
     CHECK(ws_service_send_opus_frame(data, sizeof(data)) == ESP_ERR_INVALID_ARG);
     state = WS_STATE_DISCONNECTED;
     CHECK(ws_service_send_opus_frame(data, expected_len) == ESP_ERR_INVALID_STATE);
-    state = WS_STATE_CONNECTED; reminder_mode = true;
-    CHECK(ws_service_send_opus_frame(data, expected_len) == ESP_ERR_INVALID_STATE); reminder_mode = false;
+    state = WS_STATE_AUTHING;
+    CHECK(ws_service_send_opus_frame(data, expected_len) == ESP_ERR_INVALID_STATE);
+    state = WS_STATE_CONNECTED;
     fail_base64 = true; CHECK(ws_service_send_opus_frame(data, expected_len) == ESP_FAIL);
     fail_base64 = false; fail_send = true; CHECK(ws_service_send_opus_frame(data, expected_len) == ESP_FAIL);
     fail_send = false; CHECK(ws_service_send_opus_frame(data, expected_len) == ESP_OK);

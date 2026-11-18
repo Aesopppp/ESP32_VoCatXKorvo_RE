@@ -13,144 +13,24 @@
 
 static const char *TAG = "app_state";
 
-app_state_t app_state_handle_event(const app_event_t *evt, app_state_t prev)
-{
-    if (!evt) return prev;
-    switch (evt->id) {
-    case EV_AUDIO_WAKE_DETECTED:
-        return app_state_start_listening()==ESP_OK ? APP_STATE_LISTENING : APP_STATE_ERROR;
-    case EV_AUDIO_SPEECH_START:
-        /* 本地 VAD 仅更新静默计时，不改变播放状态。 */
-        if (prev == APP_STATE_LISTENING) app_state_reset_silence_timer();
-        return prev;
-    case EV_AUDIO_OUT_START:
-        return APP_STATE_PLAYING;
-    case EV_WS_SPEECH_STARTED:
-    case EV_WS_RESPONSE_INTERRUPTED:
-        /* worker 已处理平台打断；主任务负责实际 UI 和计时器变更。 */
-        return APP_STATE_LISTENING;
-    case EV_AUDIO_SILENCE_TIMEOUT:
-        app_state_back_to_wait_wake(true); return APP_STATE_WAIT_WAKE;
-    case EV_AUDIO_SPEAKING_STARTED: return APP_STATE_PLAYING;
-    case EV_AUDIO_OUT_DONE:
-    case EV_AUDIO_SPEAKING_DONE:
-        /* Keep the conversation active after playback. The next utterance
-         * can start without another wake word; the silence timer provides the
-         * one-minute inactivity boundary back to WAIT_WAKE. */
-        return app_state_start_listening() == ESP_OK
-                   ? APP_STATE_LISTENING : APP_STATE_ERROR;
-    case EV_SYSTEM_ERROR:
-    case EV_AUDIO_INPUT_ERROR: return APP_STATE_ERROR;
-    default: return prev;
-    }
-}
+/* 状态仅用于应用和界面；音频收发与静默判定由主任务统一协调。 */
+static app_state_t s_state = APP_STATE_INIT;
+static SemaphoreHandle_t s_state_lock;
 
-/* 默认 1 分钟静音超时（毫秒） */
-#ifndef CONFIG_SILENCE_TIMEOUT_MS
-#define CONFIG_SILENCE_TIMEOUT_MS 60000
-#endif
-
-/* 全局单例 */
-static app_state_global_t s_global = {
-    .state               = APP_STATE_INIT,
-    .lock                = NULL,
-    .bus                 = NULL,
-    .p1_enabled          = true,   /* P1 默认使能，编译期可关闭 */
-    .silence_timer       = NULL,
-    .silence_timeout_ms  = CONFIG_SILENCE_TIMEOUT_MS,
-};
-
-/* 互斥锁保护 */
-static SemaphoreHandle_t s_state_lock = NULL;
-
-/* ---------------------------------------------------------------------------
- * 静音超时定时器回调
- *--------------------------------------------------------------------------*/
-static void silence_timeout_callback(void *arg)
-{
-    ESP_LOGW(TAG, "Silence timeout: no speech for %lld ms, going back to WAIT_WAKE",
-             (int64_t)(intptr_t)arg);
-    /* 定时器回调中不能销毁自己，通过事件通知 app_main 处理 */
-    event_bus_publish(EV_AUDIO_SILENCE_TIMEOUT, NULL, 0);
-}
-
-/* ---------------------------------------------------------------------------
- * 定时器辅助函数
- *--------------------------------------------------------------------------*/
-static esp_err_t start_silence_timer(void)
-{
-    if (s_global.silence_timer != NULL) {
-        /* 已有定时器，先 stop */
-        esp_err_t stop_err = esp_timer_stop(s_global.silence_timer);
-        if (stop_err != ESP_OK && stop_err != ESP_ERR_INVALID_STATE) return stop_err;
-    } else {
-        /* 创建单次定时器（不在 WAIT_WAKE 时销毁以简化生命周期管理，
-         * 复用同一个 handle，WAIT_WAKE 时 stop 即可） */
-        const esp_timer_create_args_t args = {
-            .callback       = silence_timeout_callback,
-            .arg            = (void *)(intptr_t)s_global.silence_timeout_ms,
-            .dispatch_method = ESP_TIMER_TASK,  /* 回调在独立任务中执行 */
-            .name           = "silence_timer",
-        };
-        esp_err_t err = esp_timer_create(&args, &s_global.silence_timer);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "create silence_timer failed: %s", esp_err_to_name(err));
-            return err;
-        }
-    }
-
-    esp_err_t err = esp_timer_start_once(s_global.silence_timer,
-                                          s_global.silence_timeout_ms * 1000ULL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "start silence_timer failed: %s", esp_err_to_name(err));
-    }
-    return err;
-}
-
-static esp_err_t stop_silence_timer(void)
-{
-    if (s_global.silence_timer == NULL) {
-        return ESP_OK;
-    }
-    esp_err_t err = esp_timer_stop(s_global.silence_timer);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "stop silence_timer failed: %s", esp_err_to_name(err));
-    }
-    return err;
-}
-
-/* ---------------------------------------------------------------------------
- * 公开 API
- *--------------------------------------------------------------------------*/
 esp_err_t app_state_init(event_bus_t bus)
 {
-    s_state_lock = xSemaphoreCreateMutex();
-    if (s_state_lock == NULL) {
-        ESP_LOGE(TAG, "create lock failed");
-        return ESP_FAIL;
-    }
-
-    memset(&s_global, 0, sizeof(s_global));
-    s_global.lock                = s_state_lock;
-    s_global.bus                 = bus;
-    s_global.state               = APP_STATE_INIT;
-    s_global.silence_timeout_ms  = CONFIG_SILENCE_TIMEOUT_MS;
-
-    ESP_LOGI(TAG, "app_state initialized (silence_timeout=%lld ms)",
-             s_global.silence_timeout_ms);
+    (void)bus;
+    if (!s_state_lock) s_state_lock = xSemaphoreCreateMutex();
+    if (!s_state_lock) return ESP_ERR_NO_MEM;
+    s_state = APP_STATE_INIT;
     return ESP_OK;
-}
-
-app_state_global_t *app_state_get_global(void)
-{
-    return &s_global;
 }
 
 app_state_t app_state_get(void)
 {
     app_state_t s;
     if (s_state_lock && xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
-        s = s_global.state;
+        s = s_state;
         xSemaphoreGive(s_state_lock);
     } else {
         s = APP_STATE_INIT;
@@ -162,12 +42,12 @@ app_state_t app_state_set(app_state_t new_state)
 {
     app_state_t old_state = APP_STATE_INIT;
     if (s_state_lock && xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
-        old_state = s_global.state;
+        old_state = s_state;
         if (old_state != new_state) {
             ESP_LOGI(TAG, "state: %s -> %s",
                      app_state_name(old_state),
                      app_state_name(new_state));
-            s_global.state = new_state;
+            s_state = new_state;
         }
         xSemaphoreGive(s_state_lock);
     }
@@ -188,9 +68,7 @@ const char *app_state_name(app_state_t s)
         case APP_STATE_PLAYING:         return "PLAYING";
         case APP_STATE_ERROR:           return "ERROR";
         case APP_STATE_SLEEP:           return "SLEEP";
-        case APP_STATE_CANCELLING:      return "CANCELLING";
         case APP_STATE_PROVISIONING:    return "PROVISIONING";
-        case APP_STATE_REMINDER_WAITING: return "REMINDER_WAITING";
         default:                        return "UNKNOWN";
     }
 }
@@ -212,26 +90,13 @@ esp_err_t app_state_start_listening(void)
         return err;
     }
 
-    /* 首次进入或回答结束后都重新开始一分钟静音计时 */
-    err = start_silence_timer();
-    if (err != ESP_OK) {
-        /* 定时器失败不阻塞主流程，但后续无超时保护 */
-        ESP_LOGW(TAG, "silence timer start failed, no timeout protection");
-    }
-
-    s_global.audio_stats.total_speech_turns++;
-    ESP_LOGI(TAG, "LISTENING started (turn #%llu)", s_global.audio_stats.total_speech_turns);
+    ESP_LOGI(TAG, "Full-duplex microphone upload started");
     return ESP_OK;
 }
 
-esp_err_t app_state_back_to_wait_wake(bool from_timer)
+esp_err_t app_state_back_to_wait_wake(void)
 {
     app_state_t prev = app_state_get();
-
-    /* 停止静音定时器（若由定时器回调触发则跳过 stop） */
-    if (!from_timer) {
-        stop_silence_timer();
-    }
 
     /* 停止 audio_in 收音 */
     audio_in_handle_t ai = audio_in_get_handle();
@@ -251,25 +116,4 @@ esp_err_t app_state_back_to_wait_wake(bool from_timer)
     wake_word_reset();
     ESP_LOGI(TAG, "Back to WAIT_WAKE, waiting for wake word...");
     return ESP_OK;
-}
-
-void app_state_reset_silence_timer(void)
-{
-    if (s_global.state != APP_STATE_LISTENING) {
-        return;
-    }
-    if (s_global.silence_timer == NULL) {
-        return;
-    }
-    /* 重启定时器（自动覆盖之前的启动） */
-    esp_err_t err = esp_timer_restart(s_global.silence_timer,
-                                       s_global.silence_timeout_ms * 1000ULL);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "reset silence_timer failed: %s", esp_err_to_name(err));
-    }
-}
-
-void app_state_pause_silence_timer(void)
-{
-    stop_silence_timer();
 }

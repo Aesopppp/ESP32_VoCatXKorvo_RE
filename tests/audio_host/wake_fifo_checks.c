@@ -31,7 +31,9 @@ static void *xRingbufferReceive(void *r,size_t *bytes,int t)
 static void vRingbufferReturnItem(void *r,void *p) { (void)r; (void)p; ++returned; }
 static int xRingbufferSend(void *r,void *p,size_t bytes,int t)
 { (void)r; (void)p; (void)t; CHECK(bytes==sizeof(frame)); ++queued; ++sent; return pdTRUE; }
-unsigned esp_log_timestamp(void) { return 0; }
+static int64_t test_time_us=32000;
+int64_t esp_timer_get_time(void) { return test_time_us; }
+unsigned esp_log_timestamp(void) { return (unsigned)(test_time_us/1000); }
 #include "wake_fifo.inc"
 int main(void)
 {
@@ -41,10 +43,17 @@ int main(void)
     current=APP_STATE_LISTENING; buffer_afe_audio(&res); CHECK(queued==1 && sent==1);
     current=APP_STATE_PLAYING; buffer_afe_audio(&res); CHECK(queued==2 && sent==2);
     CHECK(s_audio_progress.written_end==1024 && s_audio_progress.speech_end==1024);
+    CHECK(s_audio_progress.last_voice_ms==32);
+    test_time_us=64000; buffer_afe_audio(&res); CHECK(s_audio_progress.last_voice_ms==64);
+    test_time_us=96000; res.vad_state=0; buffer_afe_audio(&res);
+    CHECK(s_audio_progress.last_voice_ms==64); /* 有能量但 AFE 非人声，不续时。 */
+    res.vad_state=VAD_SPEECH; memset(frame,0,sizeof(frame)); buffer_afe_audio(&res);
+    CHECK(s_audio_progress.last_voice_ms==64); /* 静音包不续时。 */
+    for(unsigned i=0;i<512;++i) frame[i]=1000;
     wake_word_set_audio_buffer_enabled(false);
-    CHECK(!queued && returned==2 && !s_audio_progress.written_end);
+    CHECK(!queued && returned==5 && !s_audio_progress.written_end && !s_audio_progress.last_voice_ms);
     for(unsigned i=0;i<10000;++i) buffer_afe_audio(&res);
-    CHECK(!queued && sent==2 && !s_overflow_frames && !s_audio_progress.written_end);
+    CHECK(!queued && sent==5 && !s_overflow_frames && !s_audio_progress.written_end);
     wake_word_set_audio_buffer_enabled(true); current=APP_STATE_WAIT_WAKE;
     buffer_afe_audio(&res); CHECK(!queued);
     current=APP_STATE_LISTENING; buffer_afe_audio(&res); CHECK(queued==1);
@@ -52,5 +61,8 @@ int main(void)
     for(unsigned i=0;i<30;++i) buffer_afe_audio(&res);
     CHECK(queued==16 && s_overflow_frames==15); /* 普通全双工仍保留原有 512 ms 上限。 */
     CHECK(s_audio_progress.written_end==31*512 && s_audio_progress.read_end==15*512);
+    test_time_us=(int64_t)UINT32_MAX*1000+1000;
+    buffer_afe_audio(&res); CHECK(s_audio_progress.last_voice_ms==UINT32_MAX);
+    test_time_us+=32000; buffer_afe_audio(&res); CHECK(s_audio_progress.last_voice_ms==32);
     printf("PASS: %u production microphone FIFO checks\n",checks); return 0;
 }

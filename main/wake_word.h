@@ -34,8 +34,8 @@ extern "C" {
  * 常量配置
  * ========================================================================= */
 
-/** About ten seconds in PSRAM, including per-item ring-buffer headers. Keeps
- * the start of a barge-in utterance during the eight-second cancel deadline. */
+/** PSRAM FIFO backing store including per-item headers. Actual live audio is
+ * bounded to AUDIO_UPLOAD_FIFO_MS in the producer, independent of capacity. */
 #define WAKE_WORD_RB_ITEM_SIZE  512   /* 512 × int16 = 1024 bytes/帧 */
 #define WAKE_WORD_RB_ITEM_COUNT 320
 #define WAKE_WORD_RB_TOTAL_SIZE ((WAKE_WORD_RB_ITEM_SIZE * sizeof(int16_t) + 8) * WAKE_WORD_RB_ITEM_COUNT)
@@ -112,6 +112,7 @@ typedef struct {
     uint32_t written_end;
     uint32_t read_end;
     uint32_t speech_end;
+    uint32_t last_voice_ms; /* AFE 有效人声产生时刻，单调毫秒低 32 位；0=尚无。 */
 } wake_word_audio_progress_t;
 void wake_word_get_audio_progress(wake_word_audio_progress_t *progress);
 /** audio_in 唯一消费者：非阻塞复制一帧并归还项，返回字节数及末端采样位置。
@@ -120,7 +121,7 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
 /** Flush stale PCM with the upload task stopped. */
 void wake_word_clear_audio_buffer(void);
 /* 主任务在上传已停止时切换。仅控制上传 FIFO，不停止 AFE/AEC 或共享 I2S 时钟。
- * 提醒开始设为 false，结束回待机后恢复 true；切换时清除旧采样进度。 */
+ * 普通会话和提醒均保持 true；切换时清除旧采样进度。 */
 void wake_word_set_audio_buffer_enabled(bool enabled);
 
 /**

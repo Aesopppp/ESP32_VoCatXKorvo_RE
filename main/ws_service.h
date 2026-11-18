@@ -1,18 +1,14 @@
 /**
- * ws_service.h -- ACOS V1 WebSocket client.
+ * ws_service.h -- Authenticated full-duplex WebSocket audio client.
  *
  *   Responsibilities:
- *     - Open / maintain / auto-reconnect WebSocket (WSS).
+ *     - Open / close WebSocket; main_task owns retry policy.
  *     - WebSocket Ping/Pong keepalive (handled by esp_websocket_client).
  *     - Auth handshake: send `auth` JSON on connect, wait for `__proxy_connected__`.
  *     - Upload: Opus frames -> Base64 -> `input_audio_buffer.append` text frames.
  *     - Download: raw Opus binary frames -> decode -> audio_out_play_opus().
- *     - Server events: speech_started / speech_stopped / response.audio.done / error.
- *     - Platform interruption: speech_started invalidates old RX audio; worker stops output.
- *
- *   Spec target:
- *     WSS://acos-platform.emicloud.com/acos-realtime
- *     (overridable via CFG_KEY_WS_URL or NVS)
+ *     - Server control: authentication and connection errors only.
+ *     - Continuous audio: optional speech/response events never close playback.
  *
  *   Thread-safety:
  *     Lifecycle/configuration/auth APIs are serialized by main_task.
@@ -44,27 +40,6 @@ typedef enum {
     WS_STATE_ERROR         = 4,
 } ws_conn_state_t;
 
-/* ---- Internal service event types (forwarded to app_event_queue) ----- */
-typedef enum {
-    WS_SERVICE_EVENT_CONNECTED        = 0,  /* TCP/TLS connected */
-    WS_SERVICE_EVENT_AUTH_OK          = 1,  /* __proxy_connected__ received */
-    WS_SERVICE_EVENT_AUTH_FAIL        = 2,  /* server rejected auth */
-    WS_SERVICE_EVENT_DISCONNECTED     = 3,
-    WS_SERVICE_EVENT_ERROR            = 4,
-    WS_SERVICE_EVENT_AUDIO_FRAME_IN   = 5,  /* raw Opus received */
-    WS_SERVICE_EVENT_SPEECH_STARTED   = 6,  /* server VAD: user started talking */
-    WS_SERVICE_EVENT_SPEECH_STOPPED   = 7,  /* server VAD: user stopped talking */
-    WS_SERVICE_EVENT_RESPONSE_DONE    = 8,  /* AI reply finished */
-    WS_SERVICE_EVENT_RECONNECTING     = 9,
-} ws_service_event_type_t;
-
-typedef struct {
-    ws_service_event_type_t type;
-    const uint8_t          *audio_payload; /* AUDIO_FRAME_IN: borrowed ptr */
-    size_t                  audio_len;
-    const char             *error_msg;     /* ERROR / AUTH_FAIL */
-} ws_service_event_data_t;
-
 /* ---- Public API -------------------------------------------------------- */
 esp_err_t ws_service_init(void);
 /* 主任务先 disconnect，再设置本次连接的 URL/token，最后 connect。
@@ -89,32 +64,19 @@ esp_err_t ws_service_deinit(void);
  */
 #define WS_OPUS_FRAME_MAX_BYTES 256u /* 与 16 kHz/20 ms 编码输出缓冲一致 */
 esp_err_t ws_service_send_opus_frame(const uint8_t *opus_data, size_t opus_len);
-/* 只读当前回复阶段，避免 UI 消费迟到事件后覆盖新回合。 */
-bool ws_service_reply_interrupted(void);
-bool ws_service_reply_finished(void);
 /** Main-task-only lifecycle APIs. RX callbacks never wait for audio tasks. */
 esp_err_t ws_service_authenticate(void);
 uint32_t ws_service_generation(void);
-/** 主任务超时诊断：仅记录回复阶段/音频计数，不输出请求正文。 */
-void ws_service_log_response_wait(void);
 
-/** 主任务在断连、播放器空闲时调用；复制上下文，首条 auth 携带 task_ids。
- * 提前打开下行接收门；不发送网络消息、不启动麦克风上传，disconnect 清理上下文。 */
+/** 主任务在断连时复制任务上下文，首条 auth 携带 task_ids。
+ * 仅影响鉴权字段；连接后的收发和普通会话一致，disconnect 清理上下文。 */
 esp_err_t ws_service_prepare_reminder(const char *device_id,
                                       const char *const *task_ids, size_t task_count);
-bool ws_service_reminder_timed_out(void);
 
 /** Generic JSON text send (for future protocol extensions). */
 esp_err_t ws_service_send_json(const char *json_str);
 
 ws_conn_state_t ws_service_get_state(void);
-typedef struct {
-    uint32_t generation;
-    uint32_t turn;
-} ws_reply_offer_t;
-/** 主任务轮询待交接回答。身份按连接代次和本地回合校验，迟到批准不影响新回合。 */
-bool ws_service_get_reply_offer(ws_reply_offer_t *offer);
-bool ws_service_accept_reply(const ws_reply_offer_t *offer);
 esp_websocket_client_handle_t ws_service_get_client(void);
 
 #ifdef __cplusplus

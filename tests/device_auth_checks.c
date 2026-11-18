@@ -77,6 +77,7 @@ int esp_websocket_client_send_text(esp_websocket_client_handle_t handle, const c
 #include "ws_service.c.inc"
 
 static bool session_requested, voice_auth_refresh_used, awaiting_voice_auth, waiting_for_credentials;
+static bool cleanup_pending;
 static device_mqtt_delivery_t *reminder_task;
 esp_err_t ws_service_prepare_reminder(const char *device_id, const char *const *ids, size_t count)
 {

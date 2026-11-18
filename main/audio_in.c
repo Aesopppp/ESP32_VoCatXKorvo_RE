@@ -506,6 +506,14 @@ esp_err_t audio_in_pause(audio_in_handle_t h)
     return ESP_OK;
 }
 
+uint32_t audio_in_get_last_voice_ms(audio_in_handle_t h)
+{
+    if (!h || !h->running) return 0;
+    wake_word_audio_progress_t progress;
+    wake_word_get_audio_progress(&progress);
+    return progress.last_voice_ms;
+}
+
 void audio_in_get_upload_status(audio_in_handle_t h, audio_in_upload_status_t *status)
 {
     if (!status) return;

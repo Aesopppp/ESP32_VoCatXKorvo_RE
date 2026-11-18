@@ -48,26 +48,21 @@ static bool s_started;
 static device_mqtt_delivery_t *s_main_delivery; /* 仅主任务使用；最多一个借出对象。 */
 
 typedef struct { int id, msg_id, code, raw_code, tls_error, tls_flags; } mqtt_notice_t;
-typedef struct { device_mqtt_delivery_t *tasks; device_mqtt_task_result_t result; } mqtt_result_t;
+typedef struct { device_mqtt_delivery_t *tasks; bool handled; } mqtt_result_t;
 /* worker 独占；assembly 仅 MQTT 回调写，stop/destroy 等回调退出后复位。 */
 typedef struct {
     mqtt_settings_t settings;
     esp_mqtt_client_handle_t client;
     device_mqtt_retry_t retry;
     device_mqtt_assembly_t assembly;
-    bool connected, subscribed, subscription_rejected, dirty, pending_dirty, storage_ready;
+    bool connected, subscribed, subscription_rejected, pending_dirty, storage_ready, dispatch_paused;
     int status_id, subscribe_id;
-    int ack_ids[DEVICE_TASK_HISTORY_SIZE];
-    int64_t ack_sent_at[DEVICE_TASK_HISTORY_SIZE];
-    bool ack_pending[DEVICE_TASK_HISTORY_SIZE];
-    int64_t connect_deadline, subscription_deadline, next_status, persist_at, next_ack;
+    int64_t connect_deadline, subscription_deadline, next_status, persist_at;
     int64_t status_sent_at;
     unsigned seen_wake;
-    device_mqtt_history_t history;
     mqtt_pending_store_t pending;
-    int failure_ids[DEVICE_TASK_QUEUE_SIZE];
-    int64_t failure_sent_at[DEVICE_TASK_QUEUE_SIZE];
-    device_mqtt_delivery_t *active; /* 暂借给主任务；worker 只读身份直到结果归还。 */
+    unsigned identity_serial, active_identity_serial;
+    device_mqtt_delivery_t *active; /* 暂借给主任务；归还前不修改批次内容。 */
 } mqtt_worker_t;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
@@ -128,11 +123,6 @@ static void stop_client(mqtt_worker_t *w)
     w->status_id = w->subscribe_id = -1;
     w->connect_deadline = w->subscription_deadline = 0;
     memset(&w->assembly, 0, sizeof(w->assembly));
-    for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i) {
-        w->ack_ids[i] = -1;
-        if (w->history.ids[i][0]) w->ack_pending[i] = true;
-    }
-    for (unsigned i = 0; i < DEVICE_TASK_QUEUE_SIZE; ++i) w->failure_ids[i] = -1;
     xQueueReset(s_control);
     atomic_store(&s_callback_overflow, false);
 }
@@ -165,30 +155,6 @@ static esp_err_t load_blob(const char *key, void **data, size_t *length)
     return err;
 }
 
-static bool load_history(mqtt_worker_t *w)
-{
-    void *data;
-    size_t length;
-    esp_err_t err = load_blob("played_v1", &data, &length);
-    bool legacy = false;
-    bool decoded = err == ESP_OK && device_mqtt_storage_decode_history(data, length, &w->history, &legacy);
-    free(data);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        device_mqtt_history_init(&w->history, w->settings.config.username);
-        return true;
-    }
-    if (!decoded) return false;
-    if (memchr(w->history.device_id, 0, sizeof(w->history.device_id)) &&
-        strcmp(w->history.device_id, w->settings.config.username)) {
-        device_mqtt_history_init(&w->history, w->settings.config.username);
-        return true;
-    }
-    if (!device_mqtt_history_valid(&w->history, w->settings.config.username)) return false;
-    w->dirty |= legacy; /* 正常 worker 顺序提交；新格式写成功前旧数据仍在。 */
-    if (legacy) ESP_LOGI(TAG, "Legacy task history loaded; compact storage migration pending");
-    return true;
-}
-
 static bool task_id_numeric(const char *id)
 {
     if (!id || !*id || strlen(id) > DEVICE_TASK_ID_MAX) return false;
@@ -212,35 +178,10 @@ static bool pending_valid(const mqtt_pending_store_t *pending, const char *devic
     for (unsigned i = 0; i < pending->count; ++i) {
         const mqtt_pending_entry_t *entry = &pending->entries[i];
         if (!memchr(entry->id, 0, sizeof(entry->id)) || !task_id_numeric(entry->id) ||
-            entry->received_at < 0 || entry->state > TASK_WAIT_NETWORK || entry->failure_pending > 1)
+            entry->received_at < 0 || entry->state > 2 || entry->failure_pending > 1)
             return false;
-        for (unsigned j = 0; j < i; ++j)
-            if (!strcmp(entry->id, pending->entries[j].id)) return false;
     }
     return true;
-}
-
-static int pending_find(const mqtt_pending_store_t *pending, const char *id)
-{
-    for (unsigned i = 0; i < pending->count; ++i)
-        if (!strcmp(pending->entries[i].id, id)) return (int)i;
-    return -1;
-}
-
-static void pending_remove(mqtt_worker_t *w, unsigned index)
-{
-    mqtt_pending_store_t *pending = &w->pending;
-    if (index >= pending->count) return;
-    --pending->count;
-    memmove(&pending->entries[index], &pending->entries[index + 1],
-            (pending->count - index) * sizeof(pending->entries[0]));
-    memset(&pending->entries[pending->count], 0, sizeof(pending->entries[0]));
-    memmove(w->failure_ids + index, w->failure_ids + index + 1,
-            (pending->count - index) * sizeof(w->failure_ids[0]));
-    memmove(w->failure_sent_at + index, w->failure_sent_at + index + 1,
-            (pending->count - index) * sizeof(w->failure_sent_at[0]));
-    w->failure_ids[pending->count] = -1;
-    w->pending_dirty = true;
 }
 
 static esp_err_t save_blob(const char *key, const void *data, size_t size)
@@ -261,14 +202,12 @@ static esp_err_t save_blob(const char *key, const void *data, size_t size)
     return err;
 }
 
-static esp_err_t save_task_store(mqtt_worker_t *w, bool history)
+static esp_err_t save_task_store(mqtt_worker_t *w)
 {
     void *data = device_handshake_alloc(DEVICE_MQTT_STORAGE_MAX);
     if (!data) return ESP_ERR_NO_MEM;
-    size_t size = history ? device_mqtt_storage_encode_history(&w->history, data, DEVICE_MQTT_STORAGE_MAX) :
-                           device_mqtt_storage_encode_pending(&w->pending, data, DEVICE_MQTT_STORAGE_MAX);
-    const char *key = history ? "played_v1" : "pending_v1"; /* 保留键名，原位原子替换。 */
-    esp_err_t err = size ? save_blob(key, data, size) : ESP_ERR_INVALID_SIZE;
+    size_t size = device_mqtt_storage_encode_pending(&w->pending, data, DEVICE_MQTT_STORAGE_MAX);
+    esp_err_t err = size ? save_blob("pending_v1", data, size) : ESP_ERR_INVALID_SIZE;
     free(data);
     return err;
 }
@@ -294,69 +233,27 @@ static bool load_pending(mqtt_worker_t *w)
     if (!pending_valid(&w->pending, w->settings.config.username)) return false;
     w->pending_dirty |= legacy;
     if (legacy) ESP_LOGI(TAG, "Legacy pending tasks loaded; compact storage migration pending");
-    bool reconciled = false;
-    for (unsigned i = 0; i < w->pending.count;) {
-        if (device_mqtt_history_find(&w->history, w->pending.entries[i].id) >= 0) {
-            pending_remove(w, i);
-            reconciled = true;
-        } else {
-            if (w->pending.entries[i].state == TASK_WAIT_NETWORK) {
-                w->pending.entries[i].state = TASK_READY;
-                reconciled = true;
-            }
-            ++i;
-        }
+    /* 旧版播放/失败状态不再决定任务处理；只保留尚未消费的通知 ID。
+     * played_v1 留在 NVS 中供旧固件回退，不读取、不继续写成功历史。 */
+    for (unsigned i = 0; i < w->pending.count; ++i) {
+        mqtt_pending_entry_t *entry = &w->pending.entries[i];
+        if (entry->state || entry->failure_pending) w->pending_dirty = true;
+        entry->state = entry->failure_pending = 0;
     }
-    if (reconciled) {
-        w->pending_dirty = true;
-    }
-    /* 有效数据已读入。交给 persist_state 重试迁移/对账，不能因一次写失败永久锁死恢复。 */
     return true;
 }
 
 static void persist_state(mqtt_worker_t *w)
 {
-    if ((!w->dirty && !w->pending_dirty) || now_ms() < w->persist_at) return;
-    esp_err_t err = ESP_OK;
-    /* 先落成功历史，再移除待播项；两次提交之间掉电时，启动对账可剔除旧待播副本。 */
-    if (w->dirty) {
-        err = save_task_store(w, true);
-        if (err == ESP_OK) w->dirty = false;
+    if (!w->storage_ready || !w->pending_dirty || now_ms() < w->persist_at) return;
+    esp_err_t err = save_task_store(w);
+    if (err == ESP_OK) {
+        w->pending_dirty = false;
+        ESP_LOGI(TAG, "Task notifications persisted: count=%u", (unsigned)w->pending.count);
+    } else {
+        w->persist_at = now_ms() + 5000;
+        ESP_LOGE(TAG, "Task notification save failed: %s; next handoff held", esp_err_to_name(err));
     }
-    if (err == ESP_OK && w->pending_dirty) {
-        err = save_task_store(w, false);
-        if (err == ESP_OK) {
-            w->pending_dirty = false;
-            ESP_LOGI(TAG, "Task queue persisted: count=%u", (unsigned)w->pending.count);
-        }
-    }
-    if (err == ESP_OK) return;
-    w->persist_at = now_ms() + 5000;
-    ESP_LOGE(TAG, "Task state save failed: %s; ACK and next playback held", esp_err_to_name(err));
-}
-
-static int enqueue_task_ack(mqtt_worker_t *w, const char *const *ids, unsigned count,
-                            bool audio_received)
-{
-    if (!w->connected || !w->client || !count || count > DEVICE_TASK_QUEUE_SIZE) return -1;
-    char topic[96], payload[1200];
-    int used = snprintf(topic, sizeof(topic), "devices/%s/ack", w->settings.config.username);
-    if (used <= 0 || (size_t)used >= sizeof(topic)) return -1;
-    used = snprintf(payload, sizeof(payload), "{\"task_ids\":[");
-    for (unsigned i = 0; i < count && used > 0 && (size_t)used < sizeof(payload); ++i) {
-        if (!task_id_numeric(ids[i])) return -1;
-        int n = snprintf(payload + used, sizeof(payload) - (size_t)used, "%s\"%s\"",
-                         i ? "," : "", ids[i]);
-        if (n <= 0 || (size_t)n >= sizeof(payload) - (size_t)used) return -1;
-        used += n;
-    }
-    int n = snprintf(payload + used, sizeof(payload) - (size_t)used,
-                     "],\"audio_received\":%s}", audio_received ? "true" : "false");
-    if (n <= 0 || (size_t)n >= sizeof(payload) - (size_t)used) return -1;
-    int msg_id = esp_mqtt_client_enqueue(w->client, topic, payload, 0, 1, 0, true);
-    if (msg_id < 0) ESP_LOGW(TAG, "Task ACK enqueue failed: count=%u audio_received=%d", count, audio_received);
-    else ESP_LOGI(TAG, "Task ACK queued: count=%u audio_received=%d", count, audio_received);
-    return msg_id;
 }
 
 static void consume_result(mqtt_worker_t *w)
@@ -364,33 +261,30 @@ static void consume_result(mqtt_worker_t *w)
     mqtt_result_t event;
     if (xQueueReceive(s_results, &event, 0) != pdTRUE) return;
     if (event.tasks != w->active) {
-        ESP_LOGE(TAG, "Unexpected task result; no ACK");
+        ESP_LOGE(TAG, "Unexpected task notification return");
         return;
     }
     device_mqtt_delivery_t *tasks = event.tasks;
-    /* 身份切换后旧会话不得替新设备删除任务或生成回执。 */
-    if (w->storage_ready && !strcmp(tasks->device_id, w->history.device_id)) {
-        for (unsigned i = 0; i < tasks->count; ++i) {
-            int index = pending_find(&w->pending, tasks->task_ids[i]);
-            if (event.result == DEVICE_TASK_AUDIO_RECEIVED) {
-                unsigned slot = device_mqtt_history_add(&w->history, tasks->task_ids[i]);
-                w->ack_pending[slot] = true;
-                w->ack_ids[slot] = -1;
-                w->dirty = true;
-                if (index >= 0) pending_remove(w, (unsigned)index);
-            } else if (index >= 0) {
-                mqtt_pending_entry_t *entry = &w->pending.entries[index];
-                entry->state = event.result == DEVICE_TASK_NETWORK_WAIT ?
-                    TASK_WAIT_NETWORK : TASK_WAIT_PLATFORM;
-                entry->failure_pending = 1;
-                w->failure_ids[index] = -1;
-                w->pending_dirty = true;
-            }
+    /* 批次始终是队首快照；同 ID 的后续通知也必须保留，重复业务由平台处理。
+     * 身份切换后旧对象不得删除新身份的通知（包括 A -> B -> A）。 */
+    if (w->storage_ready && w->active_identity_serial == w->identity_serial &&
+        !strcmp(tasks->device_id, w->pending.device_id)) {
+        if (event.handled) {
+            configASSERT(tasks->count <= w->pending.count);
+            unsigned remaining = w->pending.count - tasks->count;
+            memmove(w->pending.entries, w->pending.entries + tasks->count,
+                    remaining * sizeof(w->pending.entries[0]));
+            memset(w->pending.entries + remaining, 0,
+                   tasks->count * sizeof(w->pending.entries[0]));
+            w->pending.count = remaining;
+            w->pending_dirty = true;
+            w->persist_at = 0;
+            ESP_LOGI(TAG, "Task notifications handled: count=%u; playback managed by platform", tasks->count);
+        } else {
+            /* 仅真实用户唤醒、网络恢复或新通知重新打开交接，避免失败自唤醒循环。 */
+            w->dispatch_paused = true;
+            ESP_LOGI(TAG, "Task notifications retained: count=%u", tasks->count);
         }
-        w->persist_at = 0;
-        ESP_LOGI(TAG, "Reminder result: task_count=%u audio_received=%d network_wait=%d",
-                 tasks->count, event.result == DEVICE_TASK_AUDIO_RECEIVED,
-                 event.result == DEVICE_TASK_NETWORK_WAIT);
     }
     free(tasks);
     w->active = NULL;
@@ -400,7 +294,7 @@ static void consume_task(mqtt_worker_t *w, char *payload)
 {
     device_mqtt_task_t *message = device_handshake_alloc(sizeof(*message));
     if (!message || !device_mqtt_parse_task(payload, strlen(payload), message)) {
-        ESP_LOGW(TAG, "Invalid task JSON/schema or allocation failed; no playback/ACK");
+        ESP_LOGW(TAG, "Invalid task JSON/schema or allocation failed");
         free(message);
         return;
     }
@@ -409,29 +303,9 @@ static void consume_task(mqtt_worker_t *w, char *payload)
         free(message);
         return;
     }
-    int played = device_mqtt_history_find(&w->history, message->id);
-    if (played >= 0) {
-        w->ack_pending[played] = true;
-        ESP_LOGI(TAG, "Task already confirmed: id=%s; ACK again without a new session", message->id);
-        free(message);
-        return;
-    }
-    int index = pending_find(&w->pending, message->id);
-    if (index >= 0) {
-        mqtt_pending_entry_t *entry = &w->pending.entries[index];
-        /* 失败后仅新的平台投递可以重开；普通 QoS 重复/活跃任务不重新建会话。
-         * 若失败 PUBACK 还未到，先保留新意图，ACK 落盘后才允许播放。 */
-        if (entry->state != TASK_READY) {
-            entry->state = TASK_READY;
-            w->pending_dirty = true;
-            w->persist_at = 0;
-            ESP_LOGI(TAG, "Task redelivered by platform: id=%s", message->id);
-        } else ESP_LOGI(TAG, "Task duplicate ignored: id=%s", message->id);
-        free(message);
-        return;
-    }
+    w->dispatch_paused = false; /* 新投递也可重试之前未交接的通知。 */
     if (w->pending.count == DEVICE_TASK_QUEUE_SIZE) {
-        ESP_LOGW(TAG, "Task queue full: id=%s; no success ACK", message->id);
+        ESP_LOGW(TAG, "Task notification queue full: id=%s", message->id);
         free(message);
         return;
     }
@@ -441,11 +315,10 @@ static void consume_task(mqtt_worker_t *w, char *payload)
     strcpy(entry->id, message->id);
     time_t received_at = time(NULL);
     entry->received_at = received_at > 0 ? (int64_t)received_at : 0;
-    w->failure_ids[slot] = -1;
     w->pending_dirty = true;
     w->persist_at = 0;
     /* worker 批量提交后才能发给主任务。失败保持 RAM 副本并定时重试存储。 */
-    ESP_LOGI(TAG, "Task queued: id=%s count=%u voice_adapter=%d; persistence pending", message->id,
+    ESP_LOGI(TAG, "Task notification queued: id=%s count=%u voice_adapter=%d; persistence pending", message->id,
              (unsigned)w->pending.count, DEVICE_MQTT_FORWARD_TASK_TO_WS);
     free(message);
 }
@@ -477,54 +350,6 @@ static void publish_status(mqtt_worker_t *w)
         ESP_LOGI(TAG, "Status queued: msg_id=%d topic=%s; awaiting PUBACK", id,
                  w->settings.config.publish_topic);
     } else w->next_status = now_ms() + 1000;
-}
-
-static void publish_ack(mqtt_worker_t *w)
-{
-    if (!w->connected || w->dirty || w->pending_dirty || !w->storage_ready || now_ms() < w->next_ack) return;
-    w->next_ack = now_ms() + 100;
-    const char *ids[DEVICE_TASK_QUEUE_SIZE];
-    unsigned slots[DEVICE_TASK_QUEUE_SIZE], count = 0;
-    /* 失败回执保留在 NVS，掉线/重启后重发；PUBACK 后释放失败记录。
-     * 回执确认期间的新平台投递保留为 READY，不能被迟到 PUBACK 删除。 */
-    for (unsigned i = 0; i < w->pending.count; ++i) {
-        if (!w->pending.entries[i].failure_pending) continue;
-        if (w->failure_ids[i] >= 0 && now_ms() - w->failure_sent_at[i] >= 45000)
-            w->failure_ids[i] = -1;
-        if (w->failure_ids[i] >= 0) continue;
-        ids[count] = w->pending.entries[i].id;
-        slots[count++] = i;
-    }
-    if (count) {
-        int msg_id = enqueue_task_ack(w, ids, count, false);
-        if (msg_id >= 0) for (unsigned i = 0; i < count; ++i) {
-            w->failure_ids[slots[i]] = msg_id;
-            w->failure_sent_at[slots[i]] = now_ms();
-        }
-        return;
-    }
-    for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i) {
-        /* 客户端 outbox 有过期上限；不能把已过期的 msg_id 当成永久在途。
-         * 重新发送同 task_id 是幂等的，迟到的旧 PUBACK 不会匹配新 msg_id。 */
-        if (w->ack_pending[i] && w->ack_ids[i] >= 0 &&
-            now_ms() - w->ack_sent_at[i] >= 45000) w->ack_ids[i] = -1;
-        if (!w->ack_pending[i] || w->ack_ids[i] >= 0 || !w->history.ids[i][0]) continue;
-        if (!task_id_numeric(w->history.ids[i])) {
-            w->ack_pending[i] = false;
-            ESP_LOGW(TAG, "Skipping legacy nonnumeric task ID in success ACK history");
-            continue;
-        }
-        ids[count] = w->history.ids[i];
-        slots[count++] = i;
-        if (count == DEVICE_TASK_QUEUE_SIZE) break;
-    }
-    if (!count) return;
-    int msg_id = enqueue_task_ack(w, ids, count, true);
-    if (msg_id < 0) return;
-    for (unsigned i = 0; i < count; ++i) {
-        w->ack_ids[slots[i]] = msg_id;
-        w->ack_sent_at[slots[i]] = now_ms();
-    }
 }
 
 static void consume_notice(mqtt_worker_t *w, const mqtt_notice_t *event)
@@ -564,28 +389,6 @@ static void consume_notice(mqtt_worker_t *w, const mqtt_notice_t *event)
                      (long long)(w->next_status > now_ms() ? w->next_status - now_ms() : 0));
             w->status_id = -1;
             w->retry.failures = 0;
-        }
-        unsigned acked = 0;
-        for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i) {
-            if (w->ack_ids[i] != event->msg_id) continue;
-            w->ack_ids[i] = -1;
-            w->ack_pending[i] = false;
-            ++acked;
-        }
-        if (acked) ESP_LOGI(TAG, "Playback ACK PUBACK: msg_id=%d task_count=%u", event->msg_id, acked);
-        unsigned failed = 0;
-        for (unsigned i = 0; i < w->pending.count;) {
-            if (w->failure_ids[i] != event->msg_id) { ++i; continue; }
-            w->failure_ids[i] = -1;
-            w->pending.entries[i].failure_pending = 0;
-            w->pending_dirty = true;
-            ++failed;
-            if (w->pending.entries[i].state == TASK_WAIT_PLATFORM) pending_remove(w, i);
-            else ++i;
-        }
-        if (failed) {
-            w->persist_at = 0;
-            ESP_LOGI(TAG, "Failure ACK PUBACK: msg_id=%d task_count=%u", event->msg_id, failed);
         }
         break;
     }
@@ -654,35 +457,33 @@ static void mqtt_worker_step(mqtt_worker_t *w, mqtt_settings_t *next)
             free(payload);
         }
         bool new_identity = next->configured &&
-            (!memchr(w->history.device_id, 0, sizeof(w->history.device_id)) ||
-             strcmp(w->history.device_id, next->config.username));
+            (!memchr(w->pending.device_id, 0, sizeof(w->pending.device_id)) ||
+             strcmp(w->pending.device_id, next->config.username));
         bool online_again = next->enabled && next->configured &&
-            (!w->settings.enabled || !w->settings.configured || next->epoch != w->settings.epoch);
+            (!w->settings.enabled || !w->settings.configured || next->epoch != w->settings.epoch ||
+             memcmp(&next->config, &w->settings.config, sizeof(next->config)));
         device_handshake_wipe(&w->settings, sizeof(w->settings));
         w->settings = *next;
         device_handshake_wipe(next, sizeof(*next));
         if (new_identity) {
             memset(&w->pending, 0, sizeof(w->pending));
-            w->dirty = w->pending_dirty = false;
-            w->storage_ready = load_history(w) && load_pending(w);
+            ++w->identity_serial;
+            w->pending_dirty = false;
+            w->persist_at = 0;
+            w->dispatch_paused = false;
+            w->storage_ready = load_pending(w);
             if (!w->storage_ready)
-                ESP_LOGE(TAG, "Task storage unavailable/corrupt; playback blocked to avoid loss or duplicates");
-            memset(w->ack_pending, 0, sizeof(w->ack_pending));
-            for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i)
-                if (w->storage_ready && w->history.ids[i][0]) w->ack_pending[i] = true;
+                ESP_LOGE(TAG, "Task storage unavailable/corrupt; notification handoff blocked");
         }
-        if (online_again && w->storage_ready) {
-            for (unsigned i = 0; i < w->pending.count; ++i)
-                if (w->pending.entries[i].state == TASK_WAIT_NETWORK) {
-                    w->pending.entries[i].state = TASK_READY;
-                    w->pending_dirty = true;
-                    w->persist_at = 0;
-                }
-        }
+        if (online_again) w->dispatch_paused = false;
         /* 短暂掉网不能解除鉴权熔断，只有真实用户唤醒或重启可以。 */
     }
     unsigned wake = atomic_load(&s_wake_serial);
-    if (wake != w->seen_wake) { w->seen_wake = wake; device_mqtt_retry_wake(&w->retry); }
+    if (wake != w->seen_wake) {
+        w->seen_wake = wake;
+        w->dispatch_paused = false;
+        device_mqtt_retry_wake(&w->retry);
+    }
     mqtt_notice_t event;
     while (xQueueReceive(s_control, &event, 0) == pdTRUE) consume_notice(w, &event);
     char *payload;
@@ -691,7 +492,7 @@ static void mqtt_worker_step(mqtt_worker_t *w, mqtt_settings_t *next)
         free(payload);
     }
     if (atomic_exchange(&s_callback_overflow, false)) {
-        ESP_LOGE(TAG, "MQTT receive/control queue full; resynchronizing (no playback ACK)");
+        ESP_LOGE(TAG, "MQTT receive/control queue full; resynchronizing");
         connection_failed(w, 0);
     }
     if ((w->connect_deadline && now_ms() >= w->connect_deadline) ||
@@ -701,10 +502,9 @@ static void mqtt_worker_step(mqtt_worker_t *w, mqtt_settings_t *next)
         !w->retry.blocked && now_ms() >= w->retry.retry_at_ms) start_client(w);
     persist_state(w);
     publish_status(w);
-    publish_ack(w);
     if (!atomic_load(&s_dispatch_allowed) && w->active) {
         /* 空闲快照之后用户可能先唤醒。只回收尚在队列、未借出的批次，
-         * 待通话结束再与新到任务合并；主任务已领取的对象不能改动。 */
+         * 等待主任务允许交接后重新合并；主任务已领取的对象不能改动。 */
         device_mqtt_delivery_t *unclaimed = NULL;
         if (xQueueReceive(s_ready, &unclaimed, 0) == pdTRUE) {
             configASSERT(unclaimed == w->active);
@@ -714,22 +514,17 @@ static void mqtt_worker_step(mqtt_worker_t *w, mqtt_settings_t *next)
     }
     if (DEVICE_MQTT_FORWARD_TASK_TO_WS && atomic_load(&s_dispatch_allowed) &&
         w->settings.enabled && w->settings.configured && w->storage_ready &&
-        !w->dirty && !w->pending_dirty && !w->active && w->pending.count) {
-        bool ready = false;
-        for (unsigned i = 0; i < w->pending.count; ++i)
-            if (w->pending.entries[i].state == TASK_READY && !w->pending.entries[i].failure_pending)
-                ready = true;
-        device_mqtt_delivery_t *tasks = ready ? device_handshake_alloc(sizeof(*tasks)) : NULL;
+        !w->pending_dirty && !w->active && w->pending.count && !w->dispatch_paused) {
+        device_mqtt_delivery_t *tasks = device_handshake_alloc(sizeof(*tasks));
         if (tasks) {
             strcpy(tasks->device_id, w->pending.device_id);
-            for (unsigned i = 0; i < w->pending.count; ++i) {
-                const mqtt_pending_entry_t *entry = &w->pending.entries[i];
-                if (entry->state == TASK_READY && !entry->failure_pending)
-                    strcpy(tasks->task_ids[tasks->count++], entry->id);
-            }
+            tasks->count = w->pending.count;
+            for (unsigned i = 0; i < tasks->count; ++i)
+                strcpy(tasks->task_ids[i], w->pending.entries[i].id);
             if (tasks->count && xQueueSend(s_ready, &tasks, 0) == pdTRUE) {
                 w->active = tasks;
-                ESP_LOGI(TAG, "Reminder batch ready: task_count=%u", tasks->count);
+                w->active_identity_serial = w->identity_serial;
+                ESP_LOGI(TAG, "Task notifications ready: count=%u", tasks->count);
             } else free(tasks);
         }
     }
@@ -771,8 +566,8 @@ esp_err_t device_mqtt_service_init(void)
         return ESP_ERR_NO_MEM;
     }
     s_started = true;
-    ESP_LOGI(TAG, "MQTT service ready; voice forwarding=%d, pending=%u, persistent history=%u",
-             DEVICE_MQTT_FORWARD_TASK_TO_WS, DEVICE_TASK_QUEUE_SIZE, DEVICE_TASK_HISTORY_SIZE);
+    ESP_LOGI(TAG, "MQTT service ready; task wake=%d, pending=%u, playback managed by platform",
+             DEVICE_MQTT_FORWARD_TASK_TO_WS, DEVICE_TASK_QUEUE_SIZE);
     return ESP_OK;
 }
 
@@ -809,14 +604,14 @@ device_mqtt_delivery_t *device_mqtt_service_take_tasks(void)
     bool current = s_settings->enabled && s_settings->configured &&
                    !strcmp(s_main_delivery->device_id, s_settings->config.username);
     xSemaphoreGive(s_settings_lock);
-    if (!current) { device_mqtt_service_finish_tasks(s_main_delivery, DEVICE_TASK_NETWORK_WAIT); return NULL; }
+    if (!current) { device_mqtt_service_release_tasks(s_main_delivery, false); return NULL; }
     return s_main_delivery;
 }
 
-void device_mqtt_service_finish_tasks(device_mqtt_delivery_t *tasks, device_mqtt_task_result_t result)
+void device_mqtt_service_release_tasks(device_mqtt_delivery_t *tasks, bool handled)
 {
     if (!tasks || tasks != s_main_delivery) return;
-    mqtt_result_t event = { .tasks = tasks, .result = result };
+    mqtt_result_t event = { .tasks = tasks, .handled = handled };
     /* 前一结果未消费就不可能借出下一对象，队列必有空位。 */
     BaseType_t sent = xQueueSend(s_results, &event, 0);
     configASSERT(sent == pdTRUE);

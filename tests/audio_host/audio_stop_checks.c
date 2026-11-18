@@ -17,6 +17,8 @@ static int state;
 static int16_t pcm_ring[PCM_CAPACITY], last_sample;
 static size_t pcm_read, pcm_write, pcm_count;
 static unsigned checks, blocks, waits;
+static uint32_t voice_samples, last_voice_ms;
+static int64_t prefill_started_us;
 static int64_t time_us;
 static bool interrupt_on_wait;
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); exit(1); } } while(0)
@@ -36,9 +38,9 @@ static esp_err_t write_block(int16_t *pcm)
 #include "audio_stop.inc"
 int main(void)
 {
-    CHECK(!pcm_can_start(0, true) && !pcm_can_start(4799, false));
-    CHECK(pcm_can_start(4800, false));
-    CHECK(pcm_can_start(320, true)); /* 20 ms 短回答收到 EOF 后立即放行。 */
+    CHECK(!pcm_can_start(0, true, 0) && !pcm_can_start(4799, false, 0));
+    CHECK(pcm_can_start(4800, false, 0));
+    CHECK(pcm_can_start(320, true, 0)); /* 20 ms 短回答收到 EOF 后立即放行。 */
     /* 已预填 300 ms 时，模拟 230 ms 没有新 PCM 到达，10 ms 消费不欠载。
      * 只验证生产缓冲策略的储备，不模拟网络、DMA 或真实双核调度。 */
     size_t reserve = PCM_PREFILL;
