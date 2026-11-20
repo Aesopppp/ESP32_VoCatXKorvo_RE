@@ -23,7 +23,8 @@ def main():
     ws = (root / "main/ws_service.c").read_text(encoding="utf-8")
     end = ws.index("} rx_frame_t;") + len("} rx_frame_t;")
     start = ws.rindex("typedef struct {", 0, end)
-    names = ("observe_rx_packet", "release_rx_frame", "drop_audio", "enqueue_rx_frame",
+    names = ("reset_speech_status", "ws_service_get_speech_status", "observe_speech_event",
+             "observe_rx_packet", "release_rx_frame", "drop_audio", "enqueue_rx_frame",
              "handle_frame", "on_ws", "ws_service_prepare_reminder")
     (output / "ws_platform.inc").write_text(ws[start:end] + "\n" +
         "\n\n".join(extract(ws, name) for name in names), encoding="utf-8")

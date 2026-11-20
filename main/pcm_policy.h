@@ -11,7 +11,8 @@
 #define PCM_PREFILL_WAIT_MS 300u
 #define PCM_VOICE_MEAN_ABS 64u
 #define PCM_VOICE_MIN_SAMPLES 640u /* 40 ms 连续有效幅度，过滤单个脉冲。 */
-#define PCM_VOICE_HOLD_MS 250u
+/* UI 只跟随成功入队的音频，短暂断包不切画面；不用于有效语音/静默计时。 */
+#define PCM_UI_HOLD_MS 700u
 static inline bool pcm_can_start(size_t count, bool eof, uint32_t waited_ms)
 { return count > 0 && (count >= PCM_PREFILL || eof || waited_ms >= PCM_PREFILL_WAIT_MS); }
 /* 这是活动检测而非语义识别；阈值按增益前的 signed 16-bit PCM 计。 */

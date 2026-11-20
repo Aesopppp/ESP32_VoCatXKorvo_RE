@@ -34,9 +34,11 @@ esp_err_t audio_out_read_afe_input(int16_t *pcm, size_t bytes);
 /* true 幂等开启接收；缓存空时自然排空，新音频可继续播放，不依赖服务端 EOF。
  * false 仅供显式关闭写入后排空；正常全双工会话不调用。 */
 void audio_out_set_streaming(bool active);
-/* 实际输出有效幅度及 250 ms 短保持窗；仅供 UI，不控制麦克风或接收。 */
+/* 成功入队音频后的 700 ms 保持窗，或 PCM/DMA 尚未排空；无锁快照，仅供 UI。
+ * 静音音频也保持播放画面，不控制收发，不用于有效语音静默判定。 */
 bool audio_out_is_streaming(void);
-/* 最近提交给输出驱动的有效 PCM 活动，增益前判定；单调毫秒低 32 位。
+/* 最近成功入队或提交给输出驱动的有效 PCM 活动，增益前判定；单调毫秒低 32 位。
+ * 入队取消旧倒计时，播放尾音继续续期，不要求持续静音流的整个队列排空。
  * 0 表示当前流尚无活动，其他值用无符号差计算；静音/单点脉冲不会刷新。 */
 uint32_t audio_out_get_last_voice_ms(void);
 bool audio_out_is_drained(void);

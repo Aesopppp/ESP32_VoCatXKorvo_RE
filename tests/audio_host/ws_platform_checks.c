@@ -14,6 +14,8 @@
 static unsigned checks, events[128], decoded, started, queued;
 static uint32_t generation=7, played_frames, rx_drop_count, clock_ms;
 static uint32_t rx_audio_packets, rx_audio_last_ms, rx_audio_gap_max_ms, queue_wait_max_ms;
+static uint32_t rx_packet_sequence, speech_sequence;
+static bool speech_sequence_seen;
 static size_t rx_bytes;
 static int state=WS_STATE_CONNECTED, decoded_samples=960, opcode;
 static bool client_started, stop_flag, inject_disconnect, queue_fail;
@@ -23,6 +25,11 @@ static char reminder_device_id[65], reminder_task_ids[PROTO_REMINDER_TASK_IDS_MA
 static size_t reminder_task_count;
 static SemaphoreHandle_t playback_lock=(void*)1;
 static QueueHandle_t rx_queue=(void*)2;
+/* 单线程替身验证所有快照读写走短临界区，不模拟跨核调度。 */
+static unsigned speech_lock, critical_depth;
+static ws_speech_status_t speech_status;
+#define portENTER_CRITICAL(lock) do { CHECK((lock)==&speech_lock && !critical_depth); ++critical_depth; } while(0)
+#define portEXIT_CRITICAL(lock) do { CHECK((lock)==&speech_lock && critical_depth==1); --critical_depth; } while(0)
 typedef const char *esp_event_base_t;
 typedef struct {
     int op_code, payload_len, data_len, payload_offset;
@@ -90,6 +97,7 @@ static void reset(void)
     CHECK(rx_bytes==0);
     state=WS_STATE_CONNECTED; stop_flag=client_started=inject_disconnect=queue_fail=false;
     played_frames=0; decoded_samples=960; clock_ms=1000; reminder_task_count=0;
+    reset_speech_status();
     memset(reminder_device_id,0,sizeof(reminder_device_id));
     memset(reminder_task_ids,0,sizeof(reminder_task_ids));
 }
@@ -150,6 +158,104 @@ static void session_checks(void)
     reset(); decoded_samples=-1; audio(); CHECK(events[EV_WS_SERVER_ERROR]==1);
     reset(); inject_disconnect=true; audio(); CHECK(!events[EV_WS_SERVER_ERROR]);
 }
+static void speech_checks(void)
+{
+    const char *start="{\"type\":\"input_audio_buffer.speech_started\"}";
+    const char *stop="{\"type\":\"input_audio_buffer.speech_stopped\"}";
+    ws_speech_status_t status;
+    reset(); ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && !status.stopped_ms);
+    ws_service_get_speech_status(NULL); CHECK(!critical_depth);
+    control(stop); ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && status.stopped_ms==clock_ms); /* 首次 stop 也重启检测。 */
+    control(start); ws_service_get_speech_status(&status);
+    CHECK(status.speaking && status.stopped_ms==clock_ms);
+    clock_ms+=45000; audio(); ws_service_get_speech_status(&status);
+    CHECK(status.speaking && decoded==1 && !stop_flag); /* 长讲话、全双工播放。 */
+    control(start); control("{\"type\":\"conversation.item.input_audio_transcription.completed\"}");
+    control("{\"type\":\"response.done\",\"response\":{\"status\":\"completed\"}}");
+    ws_service_get_speech_status(&status); CHECK(status.speaking);
+    control(stop); ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && status.stopped_ms==46000);
+    clock_ms+=10000; control(stop); ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && status.stopped_ms==46000); /* 重复 stop 幂等。 */
+    control("{\"type\":\"conversation.item.input_audio_transcription.started\"}");
+    ws_service_get_speech_status(&status); CHECK(!status.speaking && status.stopped_ms==46000);
+    rx_frame_t stale=packet(start,1); ++generation; handle_frame(&stale);
+    ws_service_get_speech_status(&status); CHECK(!status.speaking);
+    CHECK(proto_parse_speech_event(start)==PROTO_EVT_SPEECH_STARTED);
+    CHECK(!observe_speech_event(PROTO_EVT_SPEECH_STARTED,&stale)); /* 解析后发生断连，再核对代次。 */
+    ws_service_get_speech_status(&status); CHECK(!status.speaking);
+    control(start); stale=packet(stop,1); ++generation; handle_frame(&stale);
+    ws_service_get_speech_status(&status); CHECK(status.speaking);
+    esp_websocket_event_data_t event={0};
+    on_ws(NULL,NULL,WEBSOCKET_EVENT_DISCONNECTED,&event);
+    ws_service_get_speech_status(&status); CHECK(!status.speaking && !status.stopped_ms);
+    handle_frame(&stale); ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && !status.stopped_ms);
+    state=WS_STATE_AUTHING; control(start); ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && !status.stopped_ms); /* 认证前的 VAD 不可信。 */
+    control("{\"type\":\"__proxy_connected__\"}"); control(start);
+    clock_ms=0; control(stop); ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && status.stopped_ms==UINT32_MAX); /* 0 哨兵与时钟回绕。 */
+    control(start); on_ws(NULL,NULL,WEBSOCKET_EVENT_CONNECTED,&event);
+    ws_service_get_speech_status(&status); CHECK(!status.speaking && !status.stopped_ms);
+    control("{\"type\":\"__proxy_connected__\"}"); control(start);
+    on_ws(NULL,NULL,WEBSOCKET_EVENT_ERROR,&event);
+    ws_service_get_speech_status(&status); CHECK(!status.speaking && !status.stopped_ms);
+    reset(); control(start); control("{\"type\":\"error\",\"code\":5000}");
+    ws_service_get_speech_status(&status); CHECK(!status.speaking && !status.stopped_ms);
+    CHECK(!critical_depth);
+}
+static void speech_fast_path_checks(void)
+{
+    const char *start="{\"type\":\"input_audio_buffer.speech_started\"}";
+    const char *stop="{\"type\":\"input_audio_buffer.speech_stopped\"}";
+    const char *auth="{\"type\":\"__proxy_connected__\"}";
+    ws_speech_status_t status;
+    reset(); feed(2,"opus",4,0,4);
+    clock_ms=30999;
+    feed(1,start,(int)strlen(start),0,(int)strlen(start));
+    ws_service_get_speech_status(&status);
+    CHECK(status.speaking && pending_count==1 && decoded==0); /* 不等积压音频出队。 */
+    clock_ms+=45000;
+    feed(1,stop,(int)strlen(stop),0,(int)strlen(stop));
+    ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && status.stopped_ms==clock_ms && pending_count==1);
+    drain_queue(); CHECK(decoded==1 && rx_bytes==0 && !stop_flag);
+    reset(); state=WS_STATE_AUTHING;
+    feed(1,auth,(int)strlen(auth),0,(int)strlen(auth));
+    feed(1,start,(int)strlen(start),0,(int)strlen(start));
+    feed(1,stop,(int)strlen(stop),0,(int)strlen(stop));
+    ws_service_get_speech_status(&status); CHECK(!status.speaking && pending_count==3);
+    handle_frame(&pending[0]); /* auth 已处理，但 worker 还没处理旧讲话边界。 */
+    feed(1,start,(int)strlen(start),0,(int)strlen(start));
+    ws_service_get_speech_status(&status); CHECK(status.speaking && pending_count==3);
+    drain_queue(); ws_service_get_speech_status(&status);
+    CHECK(status.speaking && !status.stopped_ms && rx_bytes==0); /* 旧 stop 不覆盖新 start。 */
+    reset(); state=WS_STATE_AUTHING;
+    feed(1,auth,(int)strlen(auth),0,(int)strlen(auth));
+    feed(1,start,(int)strlen(start),0,(int)strlen(start));
+    drain_queue(); ws_service_get_speech_status(&status);
+    CHECK(status.speaking); /* 无更新事件时，auth 后队列中的 start 仍生效。 */
+    reset(); state=WS_STATE_AUTHING;
+    feed(1,auth,(int)strlen(auth),0,(int)strlen(auth));
+    feed(1,start,(int)strlen(start),0,(int)strlen(start));
+    handle_frame(&pending[0]); clock_ms+=45000;
+    feed(1,stop,(int)strlen(stop),0,(int)strlen(stop));
+    drain_queue(); ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && status.stopped_ms==clock_ms); /* start未出队，stop仍须续期。 */
+    CHECK(proto_parse_speech_event("{\"type\":\"input_audio_buffer.speech_started\",\"type\":\"x\"}")==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_speech_event("{\"type\":\"conversation.item.input_audio_transcription.started\"}")==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_speech_event("{\"type\":\"input_audio_buffer.speech_started\"} trailing")==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_speech_event("{\"type\":\"input_audio_buffer.speech_started\\u0000bad\"}")==PROTO_EVT_UNKNOWN);
+    CHECK(proto_parse_speech_event(NULL)==PROTO_EVT_UNKNOWN);
+    reset(); rx_packet_sequence=UINT32_MAX-1;
+    feed(1,start,(int)strlen(start),0,(int)strlen(start));
+    feed(1,stop,(int)strlen(stop),0,(int)strlen(stop));
+    ws_service_get_speech_status(&status);
+    CHECK(!status.speaking && status.stopped_ms==clock_ms); /* 包序号回绕。 */
+}
 static void reminder_checks(void)
 {
     reset(); state=WS_STATE_DISCONNECTED;
@@ -200,6 +306,7 @@ static void framing_checks(void)
 }
 int main(void)
 {
-    continuous_checks(); session_checks(); reminder_checks(); framing_checks(); reset();
+    continuous_checks(); session_checks(); speech_checks(); speech_fast_path_checks();
+    reminder_checks(); framing_checks(); reset();
     printf("PASS: %u production WS continuous-duplex checks\n",checks); return 0;
 }

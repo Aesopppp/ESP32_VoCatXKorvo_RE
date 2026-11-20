@@ -27,7 +27,7 @@ static const char *s_notice;
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
 #define MENU_HEIGHT 360
-#define MENU_SLIDE_MS 250
+#define MENU_SLIDE_MS 150
 #define MENU_FRAME_MS 50 /* 与表情相同的 20fps 节拍；忙时跳帧，不追赶补帧。 */
 static bool s_menu_sliding;
 static int64_t s_slide_started_ms, s_slide_next_ms;

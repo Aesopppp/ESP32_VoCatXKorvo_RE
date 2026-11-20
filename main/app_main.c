@@ -278,6 +278,8 @@ static void start_audio_session(const char *reason)
     release_reminder(true); /* 仅表示通知已关联到会话，绝非播放完成 ACK。 */
     led_set_listening();
     ESP_LOGI(TAG, "Full-duplex session active; source=%s; continuous microphone and playback", reason);
+    ESP_LOGI(TAG, "Idle timeout: %u s; input=platform speech_started/stopped, output=PCM level",
+             SESSION_SILENCE_TIMEOUT_MS / 1000u);
 }
 
 /* 唤醒词、按键和触屏共用入口：待机不上传，认证成功后才开始监听。 */
@@ -328,12 +330,13 @@ static void poll_conversation(void)
         recover_session("continuous audio upload stopped");
         return;
     }
-    uint32_t input_voice = audio_in_get_last_voice_ms(input);
     uint32_t output_voice = audio_out_get_last_voice_ms();
+    ws_speech_status_t speech;
+    ws_service_get_speech_status(&speech);
     /* 活动由其他任务更新；读取后取 now，避免把刚产生的时间当作回绕旧值。 */
     if (session_silence_expired((uint32_t)now_ms(), session_started_ms,
-                              input_voice, output_voice)) {
-        end_conversation("60s without voice in either direction");
+                              speech.speaking, speech.stopped_ms, output_voice)) {
+        end_conversation("30s quiet after platform speech stop and downlink audio");
         return;
     }
     app_state_t desired = audio_out_is_streaming() ? APP_STATE_PLAYING : APP_STATE_LISTENING;

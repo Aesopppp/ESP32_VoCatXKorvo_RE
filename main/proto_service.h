@@ -14,8 +14,8 @@
  *   Server -> Client JSON events:
  *     __proxy_connected__, input_audio_buffer.speech_started,
  *     input_audio_buffer.speech_stopped, response.audio.done, error.
- *   Only authentication and error events control the connection; speech and
- *   response notifications never gate the continuous binary audio stream.
+ *   Speech start/stop supplies the idle timer's user-speaking state. Speech
+ *   and response notifications never gate the continuous binary audio stream.
  *
  *   Dependencies: cJSON (implementation only).
  */
@@ -96,6 +96,9 @@ bool proto_is_auth_error(const proto_msg_t *msg);
  * @param msg      output, caller-owned.
  */
 proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg);
+/* 接收侧低频控制帧快通道，只返回精确的 speech_started/stopped。
+ * 无效 JSON、重复字段、转录别名及其他事件返回 UNKNOWN，不分配 proto_msg_t。 */
+proto_event_t proto_parse_speech_event(const char *json_str);
 
 /**
  * @brief Build `auth` JSON frame (first message after WebSocket open).

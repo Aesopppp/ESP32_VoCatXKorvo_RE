@@ -12,5 +12,9 @@ static inline void atomic_flag_clear(atomic_flag *p) { *p = false; }
 #define atomic_load(p) (*(p))
 #define atomic_store(p, v) ((*(p)) = (v))
 #define atomic_fetch_add(p, v) ((*(p) += (v)) - (v))
-static inline unsigned atomic_exchange(atomic_uint *p, unsigned value)
+static inline unsigned atomic_exchange_uint(atomic_uint *p, unsigned value)
 { unsigned previous = *p; *p = value; return previous; }
+static inline bool atomic_exchange_bool(atomic_bool *p, bool value)
+{ bool previous = *p; *p = value; return previous; }
+#define atomic_exchange(p, v) _Generic((p), atomic_bool *: atomic_exchange_bool, \
+    atomic_uint *: atomic_exchange_uint)((p), (v))

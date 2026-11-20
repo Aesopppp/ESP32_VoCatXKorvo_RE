@@ -13,11 +13,15 @@
 static void *speaker=(void*)1;
 static SemaphoreHandle_t output_lock=(void*)2;
 static bool stop_requested, playback_streaming, stream_open, stream_eof, output_started, stream_drained;
+static bool pcm_received;
+static uint32_t last_pcm_ms;
 static int state;
 static int16_t pcm_ring[PCM_CAPACITY], last_sample;
 static size_t pcm_read, pcm_write, pcm_count;
 static unsigned checks, blocks, waits;
-static uint32_t voice_samples, last_voice_ms;
+static uint32_t voice_samples, received_voice_samples, last_voice_ms;
+static uint32_t received_abs_sum;
+static size_t received_samples;
 static int64_t prefill_started_us;
 static int64_t time_us;
 static bool interrupt_on_wait;
@@ -49,6 +53,7 @@ int main(void)
     }
     CHECK(reserve == 1120);
     stream_open=output_started=playback_streaming=true; pcm_count=PCM_CAPACITY;
+    pcm_received=true; last_pcm_ms=999;
     pcm_write=123; pcm_read=23; last_sample=1000;
     int16_t pcm[320]={1}; interrupt_on_wait=true;
     CHECK(audio_out_write(pcm,sizeof(pcm))==ESP_ERR_INVALID_STATE);
@@ -56,6 +61,7 @@ int main(void)
     CHECK(audio_out_stop()==ESP_OK);
     CHECK(!pcm_count && !pcm_read && !pcm_write && !stream_open && !output_started);
     CHECK(!playback_streaming && stream_drained && !audio_out_stop_requested());
+    CHECK(!pcm_received && last_pcm_ms==0);
     CHECK(blocks==PCM_DMA_BLOCKS+2 && last_sample==0 && speaker==(void*)1);
     stream_open=true; CHECK(audio_out_write(pcm,sizeof(pcm))==ESP_OK && pcm_count==320);
     CHECK(pcm_ring[0]==1); /* 新流不会继承旧队列。 */

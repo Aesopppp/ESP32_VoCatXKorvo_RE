@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 typedef enum { UI_GESTURE_NONE, UI_GESTURE_TAP, UI_GESTURE_UP, UI_GESTURE_DOWN } ui_gesture_t;
-typedef struct { bool pressed; int start_x, start_y, last_x, last_y, travel; } ui_touch_policy_t;
+typedef struct { bool pressed, swipe_up_reported; int start_x, start_y, last_x, last_y, travel; } ui_touch_policy_t;
 typedef struct { ui_gesture_t gesture; int x, y; } ui_touch_result_t;
 typedef enum { UI_PAGE_HOME, UI_PAGE_SETTINGS, UI_PAGE_CONFIRM, UI_PAGE_PROVISION } ui_page_t;
 typedef enum {
@@ -32,7 +32,8 @@ static const ui_button_t ui_confirm_buttons[] = {
 static const ui_button_t ui_provision_buttons[] = {{100, 278, 160, 44, UI_ACTION_STOP_WIFI}};
 
 static inline int ui_abs(int n) { return n < 0 ? -n : n; }
-static inline void ui_touch_cancel(ui_touch_policy_t *p) { p->pressed = false; }
+static inline void ui_touch_cancel(ui_touch_policy_t *p)
+{ p->pressed = false; p->swipe_up_reported = false; }
 static inline ui_touch_result_t ui_touch_feed(ui_touch_policy_t *p, bool down, int x, int y)
 {
     ui_touch_result_t result = {UI_GESTURE_NONE, 0, 0};
@@ -48,11 +49,21 @@ static inline ui_touch_result_t ui_touch_feed(ui_touch_policy_t *p, bool down, i
         int travel_x = ui_abs(x - p->start_x), travel_y = ui_abs(y - p->start_y);
         if (travel_x > p->travel) p->travel = travel_x;
         if (travel_y > p->travel) p->travel = travel_y;
+        int dx = p->last_x - p->start_x, dy = p->last_y - p->start_y;
+        if (!p->swipe_up_reported && p->start_y >= 300 && dy <= -60 &&
+            -dy > ui_abs(dx)) {
+            p->swipe_up_reported = true;
+            result.gesture = UI_GESTURE_UP;
+            result.x = p->last_x; result.y = p->last_y;
+        }
         return result;
     }
     if (!p->pressed) return result;
     p->pressed = false;
+    bool swipe_up_reported = p->swipe_up_reported;
+    p->swipe_up_reported = false;
     result.x = p->last_x; result.y = p->last_y;
+    if (swipe_up_reported) return result;
     int dx = p->last_x - p->start_x, dy = p->last_y - p->start_y;
     if (p->start_y >= 300 && dy <= -60 && -dy > ui_abs(dx)) result.gesture = UI_GESTURE_UP;
     else if (dy >= 60 && dy > ui_abs(dx)) result.gesture = UI_GESTURE_DOWN;

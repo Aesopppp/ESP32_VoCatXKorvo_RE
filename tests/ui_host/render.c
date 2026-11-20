@@ -86,7 +86,7 @@ static void menu_slide_checks(void) {
  assert(memcmp(home,frame,sizeof(frame))==0); /* 第一帧不先从顶部刷出菜单。 */
  if(!missing_assets) dump_frame("work/ui-checks/menu-open-00.ppm");
  int previous_y=360;
- for(unsigned step=1;step<=5;++step) {
+ for(unsigned step=1;step<=3;++step) {
   /* 滑动中点击/反向手势均不触发按钮，也不能穿透到背景首页。 */
   handle_touch((ui_touch_result_t){UI_GESTURE_TAP,80,100});
   handle_touch((ui_touch_result_t){UI_GESTURE_DOWN,180,300});
@@ -97,7 +97,7 @@ static void menu_slide_checks(void) {
   lv_refr_now(mock_display);
   assert(frame_submissions==submissions_before+1); /* 菜单一帧只提交一次，不能分块刷新。 */
   int y=lv_obj_get_y(s_menu_layer);
-  assert(y>=0 && y<previous_y); /* 菜单上沿单调向上，250ms 内落在 y=0。 */
+  assert(y>=0 && y<previous_y); /* 菜单上沿单调向上，150ms 内落在 y=0。 */
   assert(memcmp(home,frame,(size_t)y*360*sizeof(uint16_t))==0);
   if(!missing_assets) {char path[100]; snprintf(path,sizeof(path),"work/ui-checks/menu-open-%02u.ppm",step); dump_frame(path);}
   previous_y=y;
@@ -110,7 +110,7 @@ static void menu_slide_checks(void) {
  assert(s_page==UI_PAGE_HOME && s_menu_sliding && lv_obj_get_y(s_menu_layer)==0);
  if(!missing_assets) dump_frame("work/ui-checks/menu-close-00.ppm");
  previous_y=0;
- for(unsigned step=1;step<=5;++step) {
+ for(unsigned step=1;step<=3;++step) {
   handle_touch((ui_touch_result_t){UI_GESTURE_TAP,180,160});
   assert(event_count==events_before);
   mock_time_ms+=50; update_menu_slide(mock_time_ms);

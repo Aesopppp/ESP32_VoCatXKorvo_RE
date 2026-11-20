@@ -85,7 +85,8 @@ MQTT 的协议 PUBACK 与原来的业务播放结果 ACK 是两件事；前者�
 连接过程中到达的其他通知先保存，连接就绪后立即交接。
 
 设备不依赖 `speech_started` / `speech_stopped` / `audio.done` / `response.done`
-决定音频是否可播。触屏结束或双向连续 60 秒没有有效语音时关闭 WebSocket，
+决定音频是否可播。start/stop 仅标记平台判断的用户讲话状态；用户未讲话且下行
+有效声音结束后连续安静 30 秒，或用户触屏结束时关闭 WebSocket，
 平台据此挂断并释放电话、模型会话和播报。MQTT 继续在线。
 
 ## 通知交接与持久化

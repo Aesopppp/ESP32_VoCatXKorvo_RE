@@ -1,7 +1,7 @@
 /**
  * proto_service.c -- Full-duplex gateway protocol frame parser & builder.
  *
- *   仅连接鉴权和 error 控制设备会话；可选 speech/response 只识别事件类型。
+ *   鉴权/error 控制连接；speech 边界供待机计时，response 不控制连续收发。
  *   结果使用有界副本，释放 JSON 树后仍有效。
  *
  *   Frame builders are pure snprintf wrappers; Base64 encoding of Opus
@@ -58,6 +58,26 @@ static bool copy_field(const cJSON *object, const char *key, char *out, size_t s
     strcpy(out, value->valuestring);
     if (len) *len = (int)strlen(out);
     return true;
+}
+
+proto_event_t proto_parse_speech_event(const char *json_str)
+{
+    if (!json_str || !safe_structure(json_str)) return PROTO_EVT_UNKNOWN;
+    const char *end = NULL;
+    cJSON *root = cJSON_ParseWithOpts(json_str, &end, true);
+    if (!root) return PROTO_EVT_UNKNOWN;
+    proto_event_t event = PROTO_EVT_UNKNOWN;
+    if (cJSON_IsObject(root) && unique_keys(root)) {
+        const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+        if (cJSON_IsString(type)) {
+            if (strcmp(type->valuestring, "input_audio_buffer.speech_started") == 0)
+                event = PROTO_EVT_SPEECH_STARTED;
+            else if (strcmp(type->valuestring, "input_audio_buffer.speech_stopped") == 0)
+                event = PROTO_EVT_SPEECH_STOPPED;
+        }
+    }
+    cJSON_Delete(root);
+    return event;
 }
 
 proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg)

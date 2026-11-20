@@ -7,7 +7,7 @@
  *     - Auth handshake: send `auth` JSON on connect, wait for `__proxy_connected__`.
  *     - Upload: Opus frames -> Base64 -> `input_audio_buffer.append` text frames.
  *     - Download: raw Opus binary frames -> decode -> audio_out_play_opus().
- *     - Server control: authentication and connection errors only.
+ *     - Server speech state: start/stop snapshot for the main-task idle timer.
  *     - Continuous audio: optional speech/response events never close playback.
  *
  *   Thread-safety:
@@ -67,6 +67,18 @@ esp_err_t ws_service_send_opus_frame(const uint8_t *opus_data, size_t opus_len);
 /** Main-task-only lifecycle APIs. RX callbacks never wait for audio tasks. */
 esp_err_t ws_service_authenticate(void);
 uint32_t ws_service_generation(void);
+
+typedef struct {
+    bool speaking;       /* 已认证连接中的 speech_started，直到 speech_stopped。 */
+    uint32_t stopped_ms;  /* 最近有效 stop 的单调毫秒低 32 位；0 表示尚无 stop。 */
+} ws_speech_status_t;
+
+/** 获取一致的短快照，不等待音频队列/播放锁；NULL 为无操作。
+ * 只使用精确的 input_audio_buffer.speech_started/stopped；重复事件幂等。
+ * 新连接、断连/故障时清零，旧连接事件不影响当前快照。
+ * 认证后在完整控制帧到达时更新，不等待音频 worker；序号保护事件顺序。
+ * 供主任务待机判定，不控制麦克风、播放或音频接收窗口。 */
+void ws_service_get_speech_status(ws_speech_status_t *status);
 
 /** 主任务在断连时复制任务上下文，首条 auth 携带 task_ids。
  * 仅影响鉴权字段；连接后的收发和普通会话一致，disconnect 清理上下文。 */

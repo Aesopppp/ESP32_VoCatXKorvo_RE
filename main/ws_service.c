@@ -35,6 +35,12 @@ static uint32_t rx_drop_count;
 static atomic_size_t rx_bytes;
 static uint32_t played_frames, queue_wait_max_ms; /* playback_lock / worker */
 static atomic_uint rx_audio_packets, rx_audio_last_ms, rx_audio_gap_max_ms;
+static atomic_uint rx_packet_sequence;
+/* 主任务只读取短快照，不等待解码/PCM 背压，也不依赖事件总线容量。 */
+static portMUX_TYPE speech_lock = portMUX_INITIALIZER_UNLOCKED;
+static ws_speech_status_t speech_status;
+static bool speech_sequence_seen;
+static uint32_t speech_sequence;
 /* 任务编号只用于首次鉴权；连接后的收发路径与普通会话相同。 */
 static char reminder_device_id[65];
 static char reminder_task_ids[PROTO_REMINDER_TASK_IDS_MAX][129];
@@ -45,12 +51,14 @@ typedef struct {
     int opcode;
     uint32_t generation;
     uint32_t received_ms;
+    uint32_t sequence;
 } rx_frame_t;
 
 /* 完整 WS 消息重组后记录供数间隔；没有按回答轮次关闭的接收窗口。 */
 static void observe_rx_packet(rx_frame_t *packet)
 {
     packet->received_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    packet->sequence = atomic_fetch_add(&rx_packet_sequence, 1) + 1;
     if (packet->opcode != 2) return;
     uint32_t previous = atomic_exchange(&rx_audio_last_ms, packet->received_ms);
     uint32_t sequence = atomic_fetch_add(&rx_audio_packets, 1);
@@ -70,6 +78,51 @@ static bool current(const rx_frame_t *packet)
 {
     return packet->generation == atomic_load(&generation) &&
            (state == WS_STATE_CONNECTED || state == WS_STATE_AUTHING);
+}
+
+static void reset_speech_status(void)
+{
+    portENTER_CRITICAL(&speech_lock);
+    speech_status = (ws_speech_status_t){0};
+    speech_sequence_seen = false;
+    portEXIT_CRITICAL(&speech_lock);
+}
+
+void ws_service_get_speech_status(ws_speech_status_t *status)
+{
+    if (!status) return;
+    portENTER_CRITICAL(&speech_lock);
+    *status = speech_status;
+    portEXIT_CRITICAL(&speech_lock);
+}
+
+static bool observe_speech_event(proto_event_t event, const rx_frame_t *packet)
+{
+    bool started = event == PROTO_EVT_SPEECH_STARTED;
+    if (!started && event != PROTO_EVT_SPEECH_STOPPED) return false;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    bool changed = false, consumed = false;
+    portENTER_CRITICAL(&speech_lock);
+    if (packet->generation == atomic_load(&generation) && state == WS_STATE_CONNECTED) {
+        consumed = true;
+        /* 认证期间已排队的旧事件不得覆盖接收快通道处理的新事件。 */
+        if (!speech_sequence_seen || (int32_t)(packet->sequence - speech_sequence) > 0) {
+            speech_sequence_seen = true;
+            speech_sequence = packet->sequence;
+            /* 首次 stop 也记录：auth 后的 start 可能还在旧队列里。
+             * 已有 stop 且仍未开始新讲话时，重复 stop 不续期。 */
+            if (speech_status.speaking != started || (!started && !speech_status.stopped_ms)) {
+                speech_status.speaking = started;
+                if (!started) speech_status.stopped_ms = now ? now : UINT32_MAX;
+                changed = true;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&speech_lock);
+    if (changed) ESP_LOGI(TAG, "Platform speech %s; idle timer %s",
+                         started ? "started" : "stopped",
+                         started ? "paused" : "eligible after downlink silence");
+    return consumed;
 }
 
 /* 仅在连接生命周期边界采样，不逐音频帧扫描堆。按内存能力分别记录最大
@@ -227,9 +280,14 @@ static void handle_frame(const rx_frame_t *packet)
         log_server_error(&msg);
         bool auth_failed = state == WS_STATE_AUTHING || proto_is_auth_error(&msg);
         state = WS_STATE_ERROR;
+        reset_speech_status();
         publish(auth_failed ? EV_WS_AUTH_FAILED : EV_WS_SERVER_ERROR, packet->generation);
     }
-    /* speech/response 事件均为可选通知，不停止播放、不终止会话或更改收音。 */
+    /* 只有认证尚未处理时的讲话通知才需经过 worker；禁止使用转录别名。 */
+    if (strcmp(msg.raw_type, "input_audio_buffer.speech_started") == 0 ||
+        strcmp(msg.raw_type, "input_audio_buffer.speech_stopped") == 0)
+        observe_speech_event(msg.evt, packet);
+    /* speech 只更新待机依据；response 通知不停止播放或更改收音。 */
     xSemaphoreGive(playback_lock);
 }
 
@@ -268,15 +326,18 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
         log_connection_memory("before-tls");
     } else if (id == WEBSOCKET_EVENT_CONNECTED) {
         state = WS_STATE_AUTHING;
+        reset_speech_status();
         log_connection_memory("connected");
         publish(EV_WS_CONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED) {
         state = WS_STATE_DISCONNECTED;
+        reset_speech_status();
         log_transport_error("disconnected", event);
         release_rx_frame(frame, frame_size); frame = NULL; frame_size = received = 0;
         publish(EV_WS_DISCONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_ERROR) {
         state = WS_STATE_ERROR;
+        reset_speech_status();
         log_transport_error("error", event);
         log_connection_memory("transport-error");
         publish(EV_WS_ERROR, gen);
@@ -311,7 +372,12 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
             frame[received] = 0;
             rx_frame_t packet = {.data=frame, .len=received, .opcode=opcode, .generation=gen};
             observe_rx_packet(&packet);
-            enqueue_rx_frame(&packet);
+            /* 讲话边界不能被 PCM 背压/音频积压延迟。二进制热路径不解析 JSON。
+             * 认证前仍保留 FIFO 顺序；后续 worker 用序号防止旧事件反向覆盖。 */
+            bool speech_handled = packet.opcode == 1 && state == WS_STATE_CONNECTED &&
+                observe_speech_event(proto_parse_speech_event((char *)packet.data), &packet);
+            if (speech_handled) release_rx_frame(packet.data, packet.len);
+            else enqueue_rx_frame(&packet);
             frame = NULL; frame_size = received = 0;
         }
     }
@@ -425,6 +491,7 @@ esp_err_t ws_service_connect(void)
     if (!client || !credentials) return ESP_ERR_INVALID_STATE;
     if (client_started) return ESP_OK;
     state = WS_STATE_CONNECTING;
+    reset_speech_status();
     esp_err_t err = esp_websocket_client_start(client);
     if (err == ESP_OK) client_started = true;
     else {
@@ -462,6 +529,7 @@ esp_err_t ws_service_disconnect(void)
     if (!client) return ESP_ERR_INVALID_STATE;
     bool was_started = client_started;
     state = WS_STATE_DISCONNECTED;
+    reset_speech_status();
     /* 先解除 worker 的 PCM 背压，再等待 transport/播放器锁，避免关闭互等。 */
     audio_out_request_stop();
     if (client_started) {
